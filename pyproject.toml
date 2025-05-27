@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoga"
+version = "0.1.0"
+description = "AutoGA - Automated Machine Learning Framework using Genetic Algorithms"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy>=1.20.0",
+    "pandas>=1.3.0",
+    "scikit-learn>=1.0.0",
+    "deap>=1.3.1"
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/autoga"
+Repository = "https://github.com/yourusername/autoga.git"
+
+[tool.setuptools]
+packages = ["autoga"]
