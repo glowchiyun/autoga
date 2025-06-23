@@ -115,11 +115,7 @@ class Duplicate_detector():
             res = {_d: [] for _d in data}
             for _d in res.keys():
                 for row in data.index:
-<<<<<<< HEAD
-                    if _d != data[row] and jf.jaro_winkler(_d, data[row]) >  \
-=======
                     if _d != data[row] and jf.jaro_winkler_similarity(_d, data[row]) >  \
->>>>>>> 2d759d3 (更新AutoGA项目代码)
                             ((len(_d) + len(data[row])/2)*threshold):
                         res[_d].append(data[row])
                         out.loc[len(out)] = (

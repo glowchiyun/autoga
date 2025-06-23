@@ -1,11 +1,8 @@
 import numpy as np
 import pandas as pd
-<<<<<<< HEAD
-=======
 import os
 from sklearn.datasets import fetch_openml
 import logging
->>>>>>> 2d759d3 (更新AutoGA项目代码)
 
 def load_data(file_path):
     '''
@@ -13,41 +10,12 @@ def load_data(file_path):
     Parameters
     ----------
     file_path : str
-<<<<<<< HEAD
-        数据存储路径.
-=======
         数据存储路径或OpenML数据集ID.
->>>>>>> 2d759d3 (更新AutoGA项目代码)
     Returns
     -------
     data : dataframe
         返回读取后的文件
     '''
-<<<<<<< HEAD
-    path=str(file_path)
-    try:
-        if '.csv' in path:
-            data = pd.read_csv(path,encoding='latin-1')
-            print("Lode file success.")
-        elif '.xls' in path:
-            data = pd.read_excel(path,encoding='latin-1')
-            print("Lode file success.")
-        elif '.h5' in path:
-            data = pd.read_hdf(path)
-        else:
-            print("Unsupported file type.")
-            return None
-        return data
-    except Exception as e:
-        print("Error loading data: ", e)
-        return None
-    #删除未命名的列
-    try:
-        del data["Unnamed: 0"]
-    except Exception:
-        pass
-    
-=======
     path = str(file_path)
     try:
         # 检查是否是OpenML数据集ID
@@ -92,7 +60,6 @@ def load_data(file_path):
         logging.error(f"加载数据时发生错误: {str(e)}")
         return None
 
->>>>>>> 2d759d3 (更新AutoGA项目代码)
 def auto_detect_dtypes(df):
     '''
     自动探查并转换数据类型
