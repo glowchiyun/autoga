@@ -245,7 +245,16 @@ class Normalizer():
 
         # Apply log10 normalization
         for column in X.columns:
+<<<<<<< HEAD
             X[column] = np.log10(X[column] + 1)  # Add 1 to avoid log10(0)
+=======
+            # 确保数据为正数，避免 log10 的无效值
+            min_val = X[column].min()
+            if min_val <= 0:
+                # 如果最小值小于等于0，将所有值平移使其为正
+                X[column] = X[column] - min_val + 1
+            X[column] = np.log10(X[column])
+>>>>>>> 2d759d3 (更新AutoGA项目代码)
 
         # Merge back non-numeric columns
         df = X.join(Y)

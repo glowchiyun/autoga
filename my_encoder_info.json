@@ -1,0 +1,23 @@
+{
+  "ratio_threshold": 0.3,
+  "count_threshold": 20,
+  "encoding_info": {
+    "binary_feature": {
+      "strategy": "LE",
+      "n_unique_values": 2,
+      "n_output_features": 1,
+      "ratio": 0.002
+    },
+    "categorical_feature": {
+      "strategy": "BE",
+      "n_unique_values": 5,
+      "n_output_features": 3,
+      "ratio": 0.005
+    }
+  },
+  "skipped_features": {
+    "high_cardinality": "唯一值数量过多 (100 >= 20)",
+    "constant_feature": "只有一个唯一值"
+  },
+  "is_fitted": true
+}

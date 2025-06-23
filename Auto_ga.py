@@ -1,8 +1,6 @@
 import random
 import logging
-import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
 from joblib import Parallel, delayed
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
@@ -15,12 +13,11 @@ import feature_selector as fs
 import regressor as rg
 import classifier as cl
 import time
-from sklearn.metrics import r2_score, mean_squared_error
 import matplotlib.pyplot as plt
 import codecs
 import sys
-from scipy import stats
 import encoder as enc
+import pandas as pd
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
 plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
@@ -84,49 +81,104 @@ class FitnessPredictor:
         return self.model.predict(X)[0]
 
 class GeneticAlgorithm:
-    def __init__(self, use_prediction=True,cv_scoring='neg_mean_squared_error'):
-        self.preprocessing_steps = None
-        self.model_hyperparameters = None
-        self.pre_len = None
-        self.fitness_predictor = FitnessPredictor()
+    def __init__(self, data, target, use_prediction=True, cv_scoring=None, enable_ensemble=False):
+        """
+        初始化遗传算法
+        :param data: 输入数据
+        :param target: 目标变量
+        :param use_prediction: 是否使用预测模型
+        :param cv_scoring: 交叉验证评分方法
+        :param enable_ensemble: 是否启用集成
+        """
+        self.data = data
+        self.target = target
         self.use_prediction = use_prediction
-        self.prediction_threshold = 0.9
+        self.enable_ensemble = enable_ensemble
+        self.top_models = []  # 存储表现最好的模型
+        self.ensemble_size = 5 # 集成模型数量
+        
+        # 检测任务类型
+        self.task_type, target_encoder = self.detect_task_type(data, target)
+        logging.info(f"检测到任务类型: {self.task_type}")
+        
+        # 初始化全局编码器（在进化开始前训练一次）
+        logging.info("初始化全局编码器...")
+        enc.global_encoder.train_on_data(data, ratio_threshold=0.5, count_threshold=50)
+        encoding_summary = enc.global_encoder.get_encoding_summary()
+        logging.info(f"全局编码器初始化完成: 编码{encoding_summary['total_features']}个特征，跳过{encoding_summary['skipped_features']}个特征")
+        
+        # 根据任务类型设置搜索空间
+        self.preprocessing_steps = self._get_default_preprocessing_steps()
+        self.model_hyperparameters = self._get_default_model_hyperparameters()
+        self.pre_len = len(self.preprocessing_steps)
+        
+        # 设置交叉验证评分方法
+        if cv_scoring is None:
+            self.cv_scoring = 'neg_mean_squared_error' if self.task_type == 'regression' else 'accuracy'
+        else:
+            self.cv_scoring = cv_scoring
+        self.target_encoder = target_encoder
+        
+        # 初始化其他属性
         self.best_score = -np.inf
-        self.task_type = None  
-        self.cv_scoring = cv_scoring
+        self.fitness_predictor = FitnessPredictor()
+
     def detect_task_type(self, data, target):
         """
         自动检测任务类型
         :param data: 输入数据
         :param target: 目标变量
-        :return: 任务类型 ('regression', 'binary_classification', 'multiclass_classification')
+        :return: (任务类型, 目标编码器)
         """
-        # 创建数据副本
-        data_encoded = data.copy()
-        target_encoder = None
+        try:
+            # 输入验证
+            if data is None or data.empty or target not in data.columns:
+                raise ValueError("数据为空或目标变量不存在")
+            
+            target_series = data[target].dropna()
+            if len(target_series) == 0:
+                raise ValueError("目标变量没有有效值")
+            
+            target_dtype = target_series.dtype
+            n_unique = target_series.nunique()
+            n_samples = len(target_series)
+            
+            logging.info(f"目标变量 '{target}': 类型={target_dtype}, 唯一值={n_unique}, 样本数={n_samples}")
+            
+            # 字符串/分类类型 - 需要编码
+            if target_dtype in ['object', 'category', 'string']:
+                from sklearn.preprocessing import LabelEncoder
+                target_encoder = LabelEncoder()
+                target_encoder.fit(target_series)
+                logging.info(f"已编码目标变量，映射: {dict(zip(target_encoder.classes_, range(len(target_encoder.classes_))))}")
         
-        # 如果目标变量不是数值类型，先进行编码
-        if data[target].dtype == 'object' or data[target].dtype == 'category':
-            from sklearn.preprocessing import LabelEncoder
-            target_encoder = LabelEncoder()
-            data_encoded[target] = target_encoder.fit_transform(data[target])
-            logging.info(f"目标变量 '{target}' 已使用LabelEncoder编码")
-            logging.info(f"编码映射: {dict(zip(target_encoder.classes_, target_encoder.transform(target_encoder.classes_)))}")
-        
-        # 使用编码后的数据检测任务类型
-        target_values = data_encoded[target].unique()
-        n_classes = len(target_values)
-        
-        if data_encoded[target].dtype in ['float64', 'float32', 'int64', 'int32']:
-            # 检查是否可能是回归任务
-            if n_classes > 10:  
-                return 'regression', target_encoder
-        
-        # 分类任务
-        if n_classes == 2:
-            return 'binary_classification', target_encoder
-        else:
-            return 'multiclass_classification', target_encoder
+                if n_unique == 2:
+                    return 'binary_classification', target_encoder
+                else:
+                    return 'multiclass_classification', target_encoder
+            
+            # 数值类型判断
+            elif target_dtype in ['int64', 'int32', 'int16', 'int8', 'float64', 'float32']:
+                # 二分类
+                if n_unique == 2:
+                    return 'binary_classification', None
+                
+                # 多分类（类别数较少）
+                elif n_unique <= 8 and n_unique <= n_samples * 0.1:
+                    return 'multiclass_classification', None
+                
+                # 回归任务
+                else:
+                    return 'regression', None
+            
+            # 其他类型默认为回归
+            else:
+                logging.warning(f"不支持的数据类型: {target_dtype}，默认为回归任务")
+                return 'regression', None
+                
+        except Exception as e:
+            logging.error(f"任务类型检测失败: {str(e)}")
+            return 'regression', None
 
     def _get_default_preprocessing_steps(self):
         if self.task_type == 'regression':
@@ -134,27 +186,24 @@ class GeneticAlgorithm:
                 'normalizer': ['', 'ZS', 'DS', 'Log10', 'MM'],
                 'imputer': ['EM', 'MICE', 'MF', 'MEDIAN', 'RAND'],
                 'outliers': ['', 'ZSB', 'IQR'],
-                'duplicate_detector': ['', 'ED', 'MARK', 'DL', 'LM', 'JW'],
+                'duplicate_detector': ['', 'ED'],
                 'feature_selector': ['', 'MR', 'VAR', 'LC', 'L1', 'IMP'],
-                'encoder': ['',  'LE', 'OHE', 'BE', 'WOE']
             }
         elif self.task_type == 'binary_classification':
             return {
                 'normalizer': ['', 'ZS', 'DS', 'Log10', 'MM'],
                 'imputer': ['EM', 'MICE', 'MF', 'MEDIAN', 'RAND'],
                 'outliers': ['', 'ZSB', 'IQR'],
-                'duplicate_detector': ['', 'ED', 'MARK', 'DL', 'LM', 'JW'],
-                'feature_selector': ['', 'MR', 'VAR', 'LC', 'Tree', 'WR', 'SVC'],
-                'encoder': ['',  'LE', 'OHE', 'BE', 'WOE']
+                'duplicate_detector': ['', 'ED'],
+                'feature_selector': ['', 'MR', 'VAR', 'LC', 'Tree', 'WR'],
             }
         else:  # multiclass_classification
             return {
                 'normalizer': ['', 'ZS', 'DS', 'Log10', 'MM'],
                 'imputer': ['EM', 'MICE', 'MF', 'MEDIAN', 'RAND'],
                 'outliers': ['', 'ZSB', 'IQR'],
-                'duplicate_detector': ['', 'ED', 'MARK', 'DL', 'LM', 'JW'],
-                'feature_selector': ['', 'MR', 'VAR', 'LC', 'Tree', 'WR', 'SVC'],
-                'encoder': ['',  'LE', 'OHE', 'BE', 'WOE']
+                'duplicate_detector': ['', 'ED'],
+                'feature_selector': ['', 'MR', 'VAR', 'LC', 'Tree', 'WR'],
             }
 
     def _get_default_model_hyperparameters(self):
@@ -220,16 +269,46 @@ class GeneticAlgorithm:
 
     def initialize_population(self, population_size):
         models = list(self.model_hyperparameters.keys())
-        max_hyper = max(len(p) for p in self.model_hyperparameters.values())
+        max_hyper = max(len(p) for p in self.model_hyperparameters.values()) if self.model_hyperparameters else 0
         population = []
+        
+        logging.info(f"初始化种群: 模型数量={len(models)}, 最大超参数数量={max_hyper}")
+        logging.info(f"可用模型: {models}")
+        
         for _ in range(population_size):
-            chromo = [random.randint(0, len(s)-1) for s in self.preprocessing_steps.values()]
-            model_idx = random.randint(0, len(models)-1)
+            # 确保生成的索引在有效范围内
+            chromo = []
+            
+            # 添加预处理步骤索引
+            for step_name, strategies in self.preprocessing_steps.items():
+                if len(strategies) > 0:
+                    chromo.append(random.randint(0, len(strategies)-1))
+                else:
+                    chromo.append(0)
+            
+            # 添加模型索引
+            model_idx = random.randint(0, len(models)-1) if models else 0
             chromo.append(model_idx)
-            model_name = models[model_idx]
-            hyper_params = self.model_hyperparameters[model_name]
-            chromo += [random.randint(0, len(v)-1) for v in hyper_params.values()]
-            chromo += [0]*(max_hyper - len(hyper_params))
+            
+            # 添加超参数索引
+            if models and model_idx < len(models):
+                model_name = models[model_idx]
+                hyper_params = self.model_hyperparameters[model_name]
+                
+                # 为当前模型的每个超参数添加索引
+                for param_name, values in hyper_params.items():
+                    if len(values) > 0:
+                        chromo.append(random.randint(0, len(values)-1))
+                    else:
+                        chromo.append(0)
+                
+                # 填充剩余位置到最大超参数数量
+                remaining_params = max_hyper - len(hyper_params)
+                chromo += [0] * remaining_params
+            else:
+                # 如果没有模型，填充默认值
+                chromo += [0] * max_hyper
+                
             population.append(chromo)
         return population
 
@@ -250,22 +329,32 @@ class GeneticAlgorithm:
             if random.random() < mutation_rate:
                 if i < self.pre_len:
                     strategies = list(self.preprocessing_steps.values())[i]
-                    chromosome[i] = random.randint(0, len(strategies)-1)
+                    if len(strategies) > 0:
+                        chromosome[i] = random.randint(0, len(strategies)-1)
                 elif i == self.pre_len:
-                    new_model = random.randint(0, len(models)-1)
-                    chromosome[i] = new_model
-                    model_name = models[new_model]
-                    params = self.model_hyperparameters[model_name]
-                    for j in range(len(params)):
-                        pos = self.pre_len + 1 + j
-                        chromosome[pos] = random.randint(0, len(params[list(params.keys())[j]])-1)
+                    if len(models) > 0:
+                        new_model = random.randint(0, len(models)-1)
+                        chromosome[i] = new_model
+                        model_name = models[new_model]
+                        params = self.model_hyperparameters[model_name]
+                        param_keys = list(params.keys())
+                        for j in range(len(param_keys)):
+                            pos = self.pre_len + 1 + j
+                            if pos < len(chromosome):
+                                param_values = params[param_keys[j]]
+                                if len(param_values) > 0:
+                                    chromosome[pos] = random.randint(0, len(param_values)-1)
                 elif i > self.pre_len:
                     model_idx = chromosome[self.pre_len]
-                    model_name = models[model_idx]
-                    param_idx = i - (self.pre_len + 1)
-                    if param_idx < len(self.model_hyperparameters[model_name]):
-                        param = list(self.model_hyperparameters[model_name].values())[param_idx]
-                        chromosome[i] = random.randint(0, len(param)-1)
+                    if model_idx < len(models):
+                        model_name = models[model_idx]
+                        param_idx = i - (self.pre_len + 1)
+                        param_keys = list(self.model_hyperparameters[model_name].keys())
+                        if param_idx < len(param_keys):
+                            param_key = param_keys[param_idx]
+                            param_values = self.model_hyperparameters[model_name][param_key]
+                            if len(param_values) > 0:
+                                chromosome[i] = random.randint(0, len(param_values)-1)
         return chromosome
 
     def decode_chromosome(self, chromosome):
@@ -275,25 +364,42 @@ class GeneticAlgorithm:
             'model': None,
             'hyperparameters': {}
         }
+        
+        # 解码预处理步骤
         index = 0
         for step, strategies in self.preprocessing_steps.items():
-            decoded['preprocessing'][step] = strategies[chromosome[index]]
+            if index < len(chromosome) and len(strategies) > 0:
+                strategy_idx = min(chromosome[index], len(strategies)-1)
+                decoded['preprocessing'][step] = strategies[strategy_idx]
+            else:
+                decoded['preprocessing'][step] = strategies[0] if strategies else ''
             index += 1
-        model_idx = chromosome[index]
-        decoded['model'] = models[model_idx]
+        
+        # 解码模型
+        if index < len(chromosome) and len(models) > 0:
+            model_idx = min(chromosome[index], len(models)-1)
+            decoded['model'] = models[model_idx]
+            logging.debug(f"解码模型: 染色体索引={chromosome[index]}, 模型索引={model_idx}, 模型名称={decoded['model']}")
+        else:
+            decoded['model'] = models[0] if models else None
+            logging.debug(f"解码模型: 使用默认模型={decoded['model']}")
         index += 1
-        model_params = self.model_hyperparameters[decoded['model']]
-        for i, (param, values) in enumerate(model_params.items()):
-            decoded['hyperparameters'][param] = values[chromosome[index+i]]
+            
+        # 解码超参数
+        if decoded['model'] and decoded['model'] in self.model_hyperparameters:
+            model_params = self.model_hyperparameters[decoded['model']]
+            param_keys = list(model_params.keys())
+            for param_key in param_keys:
+                values = model_params[param_key]
+                if index < len(chromosome) and len(values) > 0:
+                    value_idx = min(chromosome[index], len(values)-1)
+                    decoded['hyperparameters'][param_key] = values[value_idx]
+                else:
+                    decoded['hyperparameters'][param_key] = values[0] if values else None
+                index += 1
+            
         return decoded
     
-    #轮盘赌算法
-    #def roulette_wheel_selection(self, population, fitnesses, similarities=None):
-    #    total_fitness = sum(fitnesses)
-    #    selection_probs = [f / total_fitness for f in fitnesses]
-    #    selected_indices = np.random.choice(len(population), size=len(population), replace=True, p=selection_probs)
-    #    return [population[i] for i in selected_indices]
-
     def tournament_selection(self, population, fitnesses, tournament_size=3):
         """
         锦标赛选择
@@ -313,36 +419,127 @@ class GeneticAlgorithm:
         return selected
 
     def execute_preprocessing_plan(self, data, target, preprocessing_plan):
-        X = pd.DataFrame()
-        if 'imputer' in preprocessing_plan:
-            imp1 = imp.Imputer(data.copy(), strategy=preprocessing_plan['imputer']).transform()
-            X = imp1
-        if 'normalizer' in preprocessing_plan and preprocessing_plan['normalizer'] != '':
+        """
+        执行预处理计划
+        
+        Parameters:
+        -----------
+        data : pd.DataFrame
+            输入数据
+        target : str
+            目标变量名
+        preprocessing_plan : dict
+            预处理计划配置
+            
+        Returns:
+        --------
+        pd.DataFrame
+            预处理后的数据
+        """
+        try:
+            # 创建数据副本，避免修改原始数据
+            X = data.copy()
+            
+            # 记录预处理步骤
+            preprocessing_log = []
+            
+            # 1. 缺失值处理 - 优先处理，因为其他步骤可能依赖完整数据
+            if 'imputer' in preprocessing_plan and preprocessing_plan['imputer']:
+                try:
+                    logging.info(f"执行缺失值处理: {preprocessing_plan['imputer']}")
+                    X = imp.Imputer(X, strategy=preprocessing_plan['imputer']).transform()
+                    preprocessing_log.append(f"缺失值处理: {preprocessing_plan['imputer']}")
+                except Exception as e:
+                    logging.error(f"缺失值处理失败: {str(e)}")
+                    # 如果缺失值处理失败，使用简单的前向填充
+                    X = X.fillna(method='ffill').fillna(method='bfill')
+                    preprocessing_log.append("缺失值处理: 使用前向填充")
+            
+            # 2. 异常值检测和处理
+            if 'outliers' in preprocessing_plan and preprocessing_plan['outliers']:
+                try:
+                    logging.info(f"执行异常值检测: {preprocessing_plan['outliers']}")
+                    X = out.Outlier_detector(X, strategy=preprocessing_plan['outliers'], threshold=0.8).transform()
+                    preprocessing_log.append(f"异常值处理: {preprocessing_plan['outliers']}")
+                except Exception as e:
+                    logging.error(f"异常值检测失败: {str(e)}")
+                    preprocessing_log.append("异常值处理: 跳过")
+            
+            # 3. 重复值检测和处理
+            if 'duplicate_detector' in preprocessing_plan and preprocessing_plan['duplicate_detector']:
+                try:
+                    logging.info(f"执行重复值检测: {preprocessing_plan['duplicate_detector']}")
+                    original_size = len(X)
+                    X = dup.Duplicate_detector(X, strategy=preprocessing_plan['duplicate_detector']).transform()
+                    if X.empty:
+                        logging.warning("重复值处理后数据为空，使用原始数据")
+                        X = data.copy()
+                    else:
+                        removed_count = original_size - len(X)
+                        preprocessing_log.append(f"重复值处理: {preprocessing_plan['duplicate_detector']} (移除{removed_count}行)")
+                except Exception as e:
+                    logging.error(f"重复值检测失败: {str(e)}")
+                    preprocessing_log.append("重复值处理: 跳过")
+            
+            # 4. 特征编码 - 处理分类变量
+            try:
+                logging.info("执行特征编码")
+                X = enc.Encoder(dataset=X, ratio_threshold=0.5, count_threshold=50).transform()
+                preprocessing_log.append("特征编码: 自动编码")
+            except Exception as e:
+                logging.error(f"特征编码失败: {str(e)}")
+                preprocessing_log.append("特征编码: 跳过")
+            
+            # 5. 数据标准化/归一化
+            if 'normalizer' in preprocessing_plan and preprocessing_plan['normalizer']:
+                try:
+                    logging.info(f"执行数据标准化: {preprocessing_plan['normalizer']}")
+                    X = nl.Normalizer(X, strategy=preprocessing_plan['normalizer']).transform()
+                    preprocessing_log.append(f"数据标准化: {preprocessing_plan['normalizer']}")
+                except Exception as e:
+                    logging.error(f"数据标准化失败: {str(e)}")
+                    preprocessing_log.append("数据标准化: 跳过")
+            
+            # 6. 特征选择 - 最后执行，因为需要目标变量
+            if 'feature_selector' in preprocessing_plan and preprocessing_plan['feature_selector']:
+                try:
+                    logging.info(f"执行特征选择: {preprocessing_plan['feature_selector']}")
+                    original_features = len(X.columns)
+                    X = fs.Feature_selector(
+                        X, 
+                        target=target, 
+                        strategy=preprocessing_plan['feature_selector'], 
+                        threshold=0.1, 
+                        exclude=target
+                    ).transform()
+                    selected_features = len(X.columns)
+                    removed_features = original_features - selected_features
+                    preprocessing_log.append(f"特征选择: {preprocessing_plan['feature_selector']} (移除{removed_features}个特征)")
+                except Exception as e:
+                    logging.error(f"特征选择失败: {str(e)}")
+                    preprocessing_log.append("特征选择: 跳过")
+            
+            # 最终数据验证
             if X.empty:
-                X = data.copy()
-            n1 = nl.Normalizer(X, strategy=preprocessing_plan['normalizer']).transform()
-            X = n1
-        if 'outliers' in preprocessing_plan and preprocessing_plan['outliers'] != '':
-            if X.empty:
-                X = data.copy()
-            out1 = out.Outlier_detector(X, strategy=preprocessing_plan['outliers'], threshold=0.3).transform()
-            X = out1
-        if 'duplicates' in preprocessing_plan and preprocessing_plan['duplicate_detector'] != '':
-            if X.empty:
-                X = data.copy()
-            dup1 = dup.Duplicate_detector(X, strategy=preprocessing_plan['duplicate_detector']).transform()
-            X = dup1
-        if 'encoder' in preprocessing_plan and preprocessing_plan['encoder'] != '':
-            if X.empty:
-                X = data.copy()
-            enc1 = enc.Encoder(X, strategy=preprocessing_plan['encoder'], target=target).transform()
-            X = enc1
-        if 'feature_selector' in preprocessing_plan and preprocessing_plan['feature_selector'] != '':
-            if X.empty:
-                X = data.copy()
-            fs1 = fs.Feature_selector(X, target=target, strategy=preprocessing_plan['feature_selector'], threshold=0.1, exclude=target).transform()
-            X = fs1
-        return X
+                logging.error("预处理后数据为空，返回原始数据")
+                return data.copy()
+            
+            # 检查是否包含目标变量
+            if target not in X.columns:
+                logging.warning(f"目标变量 {target} 不在预处理后的数据中，添加回数据")
+                X[target] = data[target]
+            
+            # 记录预处理摘要
+            logging.info(f"预处理完成: {len(preprocessing_log)} 个步骤")
+            for step in preprocessing_log:
+                logging.info(f"  - {step}")
+            
+            return X
+            
+        except Exception as e:
+            logging.error(f"预处理执行失败: {str(e)}")
+            # 返回原始数据，确保算法可以继续运行
+            return data.copy()
 
     def fitness_function(self, chromosome, data, target):
         try:
@@ -356,6 +553,10 @@ class GeneticAlgorithm:
                     hyperparameters=config['hyperparameters'],
                     cv_scoring=self.cv_scoring
                 ).transform()
+                
+                if self.enable_ensemble and model is not None and score > -np.inf:
+                    self.add_top_models(chromosome, score, model, processed_features=list(processed_data.columns))
+                    
                 return score, model
             else:  # classification tasks
                 score, model = cl.Classifier(
@@ -365,6 +566,10 @@ class GeneticAlgorithm:
                     hyperparameters=config['hyperparameters'],
                     cv_scoring=self.cv_scoring
                 ).transform()
+                
+                # 如果启用集成且模型训练成功，添加到集成候选列表
+                if self.enable_ensemble and model is not None and score > -np.inf:
+                    self.add_top_models(chromosome, score, model, processed_features=list(processed_data.columns))        
                 return score, model
         except Exception as e:
             logging.error(f"Fitness calculation error: {str(e)}")
@@ -377,7 +582,7 @@ class GeneticAlgorithm:
                 predicted_fitness = self.fitness_predictor.predict(chromo)
                 if predicted_fitness is not None:
                     # 如果预测适应度高于当前最佳适应度的90%，进行实际计算
-                    if predicted_fitness > self.best_score * 0.95:
+                    if predicted_fitness > self.best_score * 0.90:
                         actual_fitness, model = self.fitness_function(chromo, data.copy(), target)
                         self.fitness_predictor.add_history(chromo, actual_fitness)
                         return (actual_fitness, chromo, model)
@@ -399,12 +604,10 @@ class GeneticAlgorithm:
             logging.error(f"评估错误: {str(e)}")
             return (-np.inf, chromo, None)
     
-    def run(self, data, target, generations=20, population_size=50, mutation_rate=0.2, 
+    def run(self, generations=20, population_size=50, mutation_rate=0.2, 
             elite_size=2, n_jobs=-1, time_limit=None, tournament_size=3):
         """
         运行遗传算法
-        :param data: 输入数据
-        :param target: 目标变量
         :param generations: 迭代次数
         :param population_size: 种群大小
         :param mutation_rate: 变异率
@@ -412,22 +615,12 @@ class GeneticAlgorithm:
         :param n_jobs: 并行数
         :param time_limit: 时间限制（秒），如果为None则不限制时间
         :param tournament_size: 锦标赛规模
-        :return: (best_config, best_score, history, avg_history, best_model)
+        :return: (best_config, best_score, history, avg_history, best_model, ensemble_model)
         """
-        # 检测任务类型并获取编码器
-        self.task_type, target_encoder = self.detect_task_type(data, target)
-        logging.info(f"检测到任务类型: {self.task_type}")
-        
-        # 如果目标变量被编码，使用编码后的数据
-        if target_encoder is not None:
-            data = data.copy()
-            data[target] = target_encoder.transform(data[target])
-        
-        # 根据任务类型设置搜索空间
-        self.preprocessing_steps = self._get_default_preprocessing_steps()
-        self.model_hyperparameters = self._get_default_model_hyperparameters()
+
         self.pre_len = len(self.preprocessing_steps)
-        
+        data=self.data
+        target=self.target
         population = self.initialize_population(population_size)
         best_config = None
         best_score = -np.inf
@@ -480,6 +673,7 @@ class GeneticAlgorithm:
             # 交叉和变异生成子代
             next_gen = []
             while len(next_gen) < population_size - elite_size:
+                #交叉逻辑需要改进
                 p1, p2 = random.sample(selected_population, 2)
                 c1, c2 = self.crossover(p1, p2)
                 next_gen.append(self.mutate(c1, mutation_rate))
@@ -492,186 +686,297 @@ class GeneticAlgorithm:
                 
             elapsed_time = time.time() - start_time
             logging.info(f"Generation {gen+1} | Best: {history[-1]:.4f} | Avg: {avg_fitness:.4f} | Time: {elapsed_time:.2f}s")
+
+        
         return best_config, best_score, history, avg_history, best_model
 
-def adjusted_r2_score(y_true, y_pred, n_features):
-    """
-    计算调整后的R2分数
-    :param y_true: 真实值
-    :param y_pred: 预测值
-    :param n_features: 特征数量
-    :return: 调整后的R2分数
-    """
-    n_samples = len(y_true)
-    r2 = r2_score(y_true, y_pred)
-    if n_samples <= n_features + 1:
-        return r2
-    return 1 - (1 - r2) * (n_samples - 1) / (n_samples - n_features - 1)
+    def add_top_models(self, chromosome, score, model, processed_features=None):
+        """
+        维护ensemble_size大小的top_models，保证其中模型类型各不相同且分数最优。
+        :param chromosome: 染色体（配置）
+        :param score: 模型得分
+        :param model: 训练好的模型
+        :param processed_features: 预处理后的特征列名列表
+        """
+        # 解码染色体获取模型类型
+        config = self.decode_chromosome(chromosome)
+        model_type = config['model']
+        model_info = {
+            'chromosome': chromosome,
+            'score': score,
+            'model': model,
+            'config': config,
+            'model_name': f"model_{len(self.top_models)}_{model_type}",
+            'estimator_type': 'regressor' if self.task_type == 'regression' else 'classifier',
+            'processed_features': processed_features  # 保存预处理后的特征列名
+        }
+        # 查找是否有相同模型类型
+        same_type_idx = next((i for i, m in enumerate(self.top_models) if m['config']['model'] == model_type), None)
+        if same_type_idx is not None:
+            # 有相同模型类型，若新分数更高则替换
+            if score > self.top_models[same_type_idx]['score']:
+                self.top_models[same_type_idx] = model_info
+        else:
+            if len(self.top_models) < self.ensemble_size:
+                self.top_models.append(model_info)
+            else:
+                # 没有相同类型且已满，与最低分比
+                min_idx = min(range(len(self.top_models)), key=lambda i: self.top_models[i]['score'])
+                if score > self.top_models[min_idx]['score']:
+                    self.top_models[min_idx] = model_info
+        # 按分数降序排序
+        self.top_models.sort(key=lambda x: x['score'], reverse=True)
+        logging.info(f"模型已添加到集成候选列表，当前候选模型数量: {len(self.top_models)}")
+
+    def integrated_predict(self, X, target=None):
+        """
+        对self.top_models中的模型进行投票/加权平均集成
+        :param X: 输入数据
+        :param target: 目标变量名
+        :return: 集成预测结果
+        """
+        if len(self.top_models) == 0:
+            logging.error("集成模型未训练或没有模型")
+            return None
+        
+        # 输出top_models中模型的配置信息
+        logging.info("集成模型配置信息:")
+        for i, model_info in enumerate(self.top_models):
+            config = model_info['config']
+            score = model_info['score']
+            model_name = model_info['model_name']
+            logging.info(f"  模型 {i+1}: {model_name}")
+            logging.info(f"    得分: {score:.4f}")
+            logging.info(f"    模型类型: {config['model']}")
+            logging.info(f"    预处理配置:")
+            for key, value in config.items():
+                if key != 'model':
+                    logging.info(f"      {key}: {value}")
+            logging.info("")
+        
+        try:
+            predictions = []
+            weights = []
+            target_processed = None
+            
+            # 为每个模型使用其对应的预处理配置
+            logging.info("为每个模型使用对应的预处理配置...")
+            
+            for model_info in self.top_models:
+                model = model_info['model']
+                model_name = model_info['model_name']
+                config = model_info['config']
+                processed_features = model_info['processed_features']
+                
+                try:
+                    # 使用每个模型对应的预处理配置
+                    preprocessing_config = config['preprocessing'].copy()
+                    preprocessing_config['feature_selector'] = ''
+                    preprocessing_config['outliers'] = ''
+                    preprocessing_config['duplicate_detector'] = ''
+                    logging.info(f"为模型 {model_name} 执行预处理...")
+                    processed_data = self.execute_preprocessing_plan(
+                        X.copy(), target, preprocessing_config
+                    )
+                    
+                    # 分离特征和目标变量
+                    if target is not None and target in processed_data.columns:
+                        target_processed = processed_data[target]
+                        processed_X = processed_data.drop(columns=[target])
+                        
+                        # 如果是分类任务且目标变量被编码了，需要解码
+                        if self.task_type != 'regression' and self.target_encoder is not None:
+                            try:
+                                # 尝试解码目标变量
+                                target_processed = self.target_encoder.inverse_transform(target_processed)
+                            except:
+                                # 如果解码失败，保持原样
+                                pass
+                    else:
+                        processed_X = processed_data
+                    
+                    logging.info(f"模型 {model_name} 预处理完成，特征数量: {len(processed_X.columns)}")
+                    
+                    # 确保特征列与训练时一致
+                    if processed_features is not None:
+                        # 获取训练时的特征列（排除目标变量）
+                        expected_features = [f for f in processed_features if f != target]
+                        current_features = list(processed_X.columns)
+                        
+                        # 如果特征不匹配，进行特征对齐
+                        if set(expected_features) != set(current_features):
+                            logging.warning(f"模型 {model_name} 特征不匹配，进行特征对齐")
+                            logging.info(f"   期望特征: {expected_features}")
+                            logging.info(f"   当前特征: {current_features}")
+                            
+                            # 移除多余的特征
+                            features_to_remove = [f for f in current_features if f not in expected_features]
+                            if features_to_remove:
+                                logging.info(f"   移除多余特征: {features_to_remove}")
+                                processed_X = processed_X.drop(columns=features_to_remove)
+                            
+                            # 确保特征顺序一致
+                            if len(expected_features) > 0:
+                                processed_X = processed_X[expected_features]
+                            
+                            logging.info(f"   对齐后特征: {list(processed_X.columns)}")
+                        
+                        # 移除非数值特征
+                        non_numeric_features = processed_X.select_dtypes(include=['object', 'string']).columns
+                        if len(non_numeric_features) > 0:
+                            logging.info(f"   移除非数值特征: {list(non_numeric_features)}")
+                            processed_X = processed_X.drop(columns=non_numeric_features)
+                        
+                        # 确保所有特征都是数值类型
+                        processed_X = processed_X.select_dtypes(include=[np.number])
+                    
+                    # 进行预测
+                    pred = model.predict(processed_X)
+                    predictions.append(pred)
+                    # 使用模型保存的正确率作为权重
+                    model_score = model_info['score']
+                    weights.append(model_score)
+                    
+                    logging.info(f"模型 {model_name} 预测完成，预测结果长度: {len(pred)}，权重: {model_score:.4f}")
+                    
+                except Exception as e:
+                    logging.error(f"模型 {model_name} 预测失败: {str(e)}")
+                    continue
+            
+            if not predictions:
+                logging.error("所有模型预测都失败了")
+                return None
+            
+            # 验证所有预测结果长度一致
+            prediction_lengths = [len(pred) for pred in predictions]
+            if len(set(prediction_lengths)) > 1:
+                logging.error(f"预测结果长度不一致: {prediction_lengths}")
+                return None
+            # 计算加权平均
+            predictions = np.array(predictions)
+            weights = np.array(weights)
+            
+            # 输出权重信息
+            logging.info("模型权重分配:")
+            for i, (model_info, weight) in enumerate(zip(self.top_models, weights)):
+                logging.info(f"  模型 {i+1} ({model_info['model_name']}): 权重 {weight:.4f}")
+            
+            # 归一化权重
+            weights = weights / np.sum(weights)
+            logging.info(f"归一化后权重: {weights}")
+            
+            final_prediction = np.average(predictions, axis=0, weights=weights)
+            
+            if self.task_type == 'classification':
+                final_prediction = np.round(final_prediction).astype(int)
+            
+            logging.info(f"集成预测完成，最终预测结果长度: {len(final_prediction)}")
+            return final_prediction, target_processed
+            
+        except Exception as e:
+            logging.error(f"集成预测失败: {str(e)}")
+            return None
 
 if __name__ == "__main__":
-    def save_results_to_log(results, config):
-        """
-        将结果保存到日志文件
-        :param results: 测试结果字典
-        :param config: 最佳配置
-        """
-        logging.info("\n" + "="*50)
-        logging.info("遗传算法运行结果总结")
-        logging.info("="*50)
-        
-        # 保存时间信息
-        logging.info("\n运行时间比较:")
-        logging.info(f"不使用预测的平均运行时间: {results['time_no_prediction']:.2f} 秒")
-        logging.info(f"使用预测的平均运行时间: {results['time_with_prediction']:.2f} 秒")
-        logging.info(f"平均时间节省: {results['time_saving_percentage']:.2f}%")
-        
-        # 保存预测模型性能
-        logging.info("\n预测模型性能:")
-        logging.info(f"平均R2分数: {results['prediction_r2']:.4f}")
-        logging.info(f"平均调整后R2分数: {results['prediction_adj_r2']:.4f}")
-        logging.info(f"平均均方误差: {results['prediction_mse']:.4f}")
-        
-        # 保存最佳适应度
-        logging.info("\n最佳适应度比较:")
-        logging.info(f"不使用预测的平均最佳适应度: {results['best_fitness_no_prediction']:.4f}")
-        logging.info(f"使用预测的平均最佳适应度: {results['best_fitness_with_prediction']:.4f}")
-        
-        # 保存最佳配置
-        logging.info("\n优化后的管道配置:")
-        for step, method in config['preprocessing'].items():
-            logging.info(f"{step}: {method}")
-        logging.info(f"模型: {config['model']}")
-        logging.info("超参数:")
-        for param, value in config['hyperparameters'].items():
-            logging.info(f"  {param}: {value}")
-        
-        logging.info("\n" + "="*50)
-
-    def test_fitness_prediction(data, target, generations=10, population_size=20, n_jobs=-1, num_runs=5, time_limit=None, cv_scoring='neg_mean_squared_error'):
-        """
-        测试适应度预测的性能（多次运行）
-        :param data: 输入数据
-        :param target: 目标变量
-        :param generations: 迭代次数
-        :param population_size: 种群大小
-        :param n_jobs: 并行数
-        :param num_runs: 运行次数
-        :param time_limit: 时间限制（秒）
-        :return: 性能比较结果
-        """
-        all_results = []
-        history_no_pred_list = []
-        history_with_pred_list = []
-        
-        for run in range(num_runs):
-            logging.info(f"\n开始第 {run + 1}/{num_runs} 次运行")
-            
-            # 1. 不使用预测的运行
-            logging.info("运行不使用适应度预测的版本...")
-            ga_no_pred = GeneticAlgorithm(use_prediction=False,cv_scoring=cv_scoring)
-            start_time = time.time()
-            best_chrom_no_pred, best_score_no_pred, history_no_pred, _, _ = ga_no_pred.run(
-                data=data,
-                target=target,
-                generations=generations,
-                population_size=population_size,
-                n_jobs=n_jobs,
-                time_limit=time_limit,
-                
-            )
-            time_no_pred = time.time() - start_time
-            history_no_pred_list.append(history_no_pred)
-            
-            # 2. 使用预测的运行
-            logging.info("运行使用适应度预测的版本...")
-            ga_with_pred = GeneticAlgorithm(use_prediction=True,cv_scoring=cv_scoring)
-            start_time = time.time()
-            best_chrom_with_pred, best_score_with_pred, history_with_pred, _, _ = ga_with_pred.run(
-                data=data,
-                target=target,
-                generations=generations,
-                population_size=population_size,
-                n_jobs=n_jobs,
-                time_limit=time_limit,
-                
-            )
-            time_with_pred = time.time() - start_time
-            history_with_pred_list.append(history_with_pred)
-            
-            # 3. 评估预测模型
-            logging.info("评估预测模型性能...")
-            actual_fitnesses = []
-            predicted_fitnesses = []
-            
-            for chromo, actual_fitness in zip(ga_no_pred.fitness_predictor.history['chromosomes'],
-                                            ga_no_pred.fitness_predictor.history['fitnesses']):
-                predicted = ga_with_pred.fitness_predictor.predict(chromo)
-                if predicted is not None:
-                    actual_fitnesses.append(actual_fitness)
-                    predicted_fitnesses.append(predicted)
-            
-            # 计算预测性能指标
-            n_features = len(ga_with_pred.fitness_predictor.history['chromosomes'][0])
-            r2 = r2_score(actual_fitnesses, predicted_fitnesses)
-            adj_r2 = adjusted_r2_score(actual_fitnesses, predicted_fitnesses, n_features)
-            mse = mean_squared_error(actual_fitnesses, predicted_fitnesses)
-            
-            # 计算时间节省
-            time_saving = (time_no_pred - time_with_pred) / time_no_pred * 100
-            
-            # 收集本次运行结果
-            run_results = {
-                'time_no_prediction': time_no_pred,
-                'time_with_prediction': time_with_pred,
-                'time_saving_percentage': time_saving,
-                'prediction_r2': r2,
-                'prediction_adj_r2': adj_r2,
-                'prediction_mse': mse,
-                'best_fitness_no_prediction': best_score_no_pred,
-                'best_fitness_with_prediction': best_score_with_pred,
-                'history_no_prediction': history_no_pred,
-                'history_with_prediction': history_with_pred
-            }
-            
-            all_results.append(run_results)
-            
-            logging.info(f"第 {run + 1} 次运行完成:")
-            logging.info(f"不使用预测的运行时间: {time_no_pred:.2f}秒")
-            logging.info(f"使用预测的运行时间: {time_with_pred:.2f}秒")
-            logging.info(f"时间节省: {time_saving:.2f}%")
-            logging.info(f"R2分数: {r2:.4f}")
-            logging.info(f"调整后的R2分数: {adj_r2:.4f}")
-            logging.info(f"均方误差: {mse:.4f}")
-        
-        # 计算平均结果
-        avg_results = {
-            'time_no_prediction': np.mean([r['time_no_prediction'] for r in all_results]),
-            'time_with_prediction': np.mean([r['time_with_prediction'] for r in all_results]),
-            'time_saving_percentage': np.mean([r['time_saving_percentage'] for r in all_results]),
-            'prediction_r2': np.mean([r['prediction_r2'] for r in all_results]),
-            'prediction_adj_r2': np.mean([r['prediction_adj_r2'] for r in all_results]),
-            'prediction_mse': np.mean([r['prediction_mse'] for r in all_results]),
-            'best_fitness_no_prediction': np.mean([r['best_fitness_no_prediction'] for r in all_results]),
-            'best_fitness_with_prediction': np.mean([r['best_fitness_with_prediction'] for r in all_results])
-        }
-        
-        # 获取最后一次运行的最佳配置
-        best_config = ga_with_pred.decode_chromosome(best_chrom_with_pred)
-        
-        # 保存结果到日志
-        save_results_to_log(avg_results, best_config)
-        
-        return avg_results, all_results
-
-    # Run test
+    import load_data as ld
+    from sklearn.model_selection import train_test_split
     data = ld.load_data("datasets/titanic_train.csv")
-    target = "Embarked"
-    avg_results, all_results = test_fitness_prediction(
-        data=data,
+    target = "Survived"
+    train_data, test_data = train_test_split(data, test_size=0.2, random_state=42)
+ 
+    ga_ensemble = GeneticAlgorithm(
+        data=train_data,
         target=target,
-        generations=20,
-        population_size=20,
-        num_runs=1,
-        cv_scoring='accuracy'
+        use_prediction=True, 
+        enable_ensemble=True 
     )
+    best_config, best_score, history, avg_history, best_model = ga_ensemble.run(
+        generations=5,  
+        population_size=5,  
+        n_jobs=1  # 禁用并行运行，使用单线程
+    )
+    
+    print(f"\n最佳单个模型得分: {best_score:.4f}")
+    
+    # 最佳单个模型在测试集上的预测
+    print("\n=== 最佳单个模型测试 ===")
+    if best_model is not None and best_config is not None:
+        try:
+            # 解码最佳配置
+            config = ga_ensemble.decode_chromosome(best_config)
+            print(f"最佳模型类型: {config['model']}")
+            print(f"最佳模型配置: {config}")
+            
+            # 对测试集进行相同的预处理
+            processed_test_data = ga_ensemble.execute_preprocessing_plan(
+                test_data.copy(), target, config['preprocessing']
+            )
+            
+            # 分离特征和目标变量
+            if target in processed_test_data.columns:
+                y_true = processed_test_data[target]
+                X_test = processed_test_data.drop(columns=[target])
+            else:
+                print("警告: 目标变量不在预处理后的数据中")
+                y_true = test_data[target]
+                X_test = processed_test_data
+            
+            # 确保所有特征都是数值类型
+            X_test = X_test.select_dtypes(include=[np.number])
+            
+            # 进行预测
+            y_pred = best_model.predict(X_test)
+            
+            # 评估结果
+            if ga_ensemble.task_type == "regression":
+                from sklearn.metrics import mean_squared_error, r2_score
+                mse = mean_squared_error(y_true, y_pred)
+                r2 = r2_score(y_true, y_pred)
+                print(f"最佳单个模型MSE: {mse:.4f}")
+                print(f"最佳单个模型R²: {r2:.4f}")
+            else:  # classification
+                from sklearn.metrics import accuracy_score, classification_report
+                accuracy = accuracy_score(y_true, y_pred)
+                print(f"最佳单个模型准确率: {accuracy:.4f}")
+                print("\n分类报告:")
+                print(classification_report(y_true, y_pred))
+                
+        except Exception as e:
+            print(f"最佳单个模型测试失败: {str(e)}")
+    else:
+        print("没有找到最佳模型")
+    
+    # 集成预测
+    print("\n=== 集成模型测试 ===")
+    result = ga_ensemble.integrated_predict(test_data, target)
+    if result is not None:
+        y_pre, y_true = result
+        
+        # 确保数据类型匹配
+        if ga_ensemble.task_type == "regression":
+            from sklearn.metrics import mean_squared_error
+            # 确保都是数值类型
+            y_true = pd.to_numeric(y_true, errors='coerce').dropna()
+            y_pre = pd.to_numeric(y_pre, errors='coerce')
+            # 对齐长度
+            min_len = min(len(y_true), len(y_pre))
+            y_true = y_true.iloc[:min_len]
+            y_pre = y_pre[:min_len]
+            mse = mean_squared_error(y_true, y_pre)
+            print(f"集成模型MSE: {mse:.4f}")
+        else:  # classification
+            from sklearn.metrics import accuracy_score
+            # 确保都是整数类型
+            y_true = pd.to_numeric(y_true, errors='coerce').dropna().astype(int)
+            y_pre = pd.to_numeric(y_pre, errors='coerce').astype(int)
+            # 对齐长度
+            min_len = min(len(y_true), len(y_pre))
+            y_true = y_true.iloc[:min_len]
+            y_pre = y_pre[:min_len]
+            accuracy = accuracy_score(y_true, y_pre)
+            print(f"集成模型准确率: {accuracy:.4f}")
+    else:
+        print("集成预测失败")
+ 
 
+  

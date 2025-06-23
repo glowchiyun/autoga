@@ -1,5 +1,11 @@
 import numpy as np
 import pandas as pd
+<<<<<<< HEAD
+=======
+import os
+from sklearn.datasets import fetch_openml
+import logging
+>>>>>>> 2d759d3 (更新AutoGA项目代码)
 
 def load_data(file_path):
     '''
@@ -7,12 +13,17 @@ def load_data(file_path):
     Parameters
     ----------
     file_path : str
+<<<<<<< HEAD
         数据存储路径.
+=======
+        数据存储路径或OpenML数据集ID.
+>>>>>>> 2d759d3 (更新AutoGA项目代码)
     Returns
     -------
     data : dataframe
         返回读取后的文件
     '''
+<<<<<<< HEAD
     path=str(file_path)
     try:
         if '.csv' in path:
@@ -36,6 +47,52 @@ def load_data(file_path):
     except Exception:
         pass
     
+=======
+    path = str(file_path)
+    try:
+        # 检查是否是OpenML数据集ID
+        if path.isdigit():
+            logging.info(f"从OpenML下载数据集ID: {path}")
+            try:
+                data = fetch_openml(data_id=int(path), as_frame=True)
+                logging.info(f"成功下载数据集: {data.details['name']}")
+                return data.frame
+            except Exception as e:
+                logging.error(f"从OpenML下载数据失败: {str(e)}")
+                return None
+        
+        # 检查文件是否存在
+        if not os.path.exists(path):
+            logging.error(f"文件不存在: {path}")
+            return None
+            
+        # 根据文件类型读取数据
+        if '.csv' in path:
+            data = pd.read_csv(path, encoding='latin-1')
+            logging.info("成功读取CSV文件")
+        elif '.xls' in path:
+            data = pd.read_excel(path, encoding='latin-1')
+            logging.info("成功读取Excel文件")
+        elif '.h5' in path:
+            data = pd.read_hdf(path)
+            logging.info("成功读取HDF5文件")
+        else:
+            logging.error("不支持的文件类型")
+            return None
+            
+        # 删除未命名的列
+        try:
+            del data["Unnamed: 0"]
+        except Exception:
+            pass
+            
+        return data
+        
+    except Exception as e:
+        logging.error(f"加载数据时发生错误: {str(e)}")
+        return None
+
+>>>>>>> 2d759d3 (更新AutoGA项目代码)
 def auto_detect_dtypes(df):
     '''
     自动探查并转换数据类型
