@@ -569,7 +569,7 @@ class GeneticAlgorithm:
                 
                 # 如果启用集成且模型训练成功，添加到集成候选列表
                 if self.enable_ensemble and model is not None and score > -np.inf:
-                    self.add_top_models(chromosome, score, model, processed_features=list(processed_data.columns))        
+                    self.add_top_models(chromosome, score, model, processed_features=list(processed_data.columns))
                 return score, model
         except Exception as e:
             logging.error(f"Fitness calculation error: {str(e)}")
@@ -672,12 +672,47 @@ class GeneticAlgorithm:
 
             # 交叉和变异生成子代
             next_gen = []
-            while len(next_gen) < population_size - elite_size:
-                #交叉逻辑需要改进
-                p1, p2 = random.sample(selected_population, 2)
-                c1, c2 = self.crossover(p1, p2)
-                next_gen.append(self.mutate(c1, mutation_rate))
-                next_gen.append(self.mutate(c2, mutation_rate))
+            # 交叉时随机选择两个模型相同的染色体进行交叉，需保证该模型在当前种群中至少有两个以上
+            # 统计每种模型的染色体索引
+            from collections import defaultdict
+            model_to_indices = defaultdict(list)
+            models = list(self.model_hyperparameters.keys())
+            for idx, chromo in enumerate(selected_population):
+                if len(chromo) > 0:
+                    model_idx = chromo[0]
+                    if model_idx < len(models):
+                        model_to_indices[model_idx].append(idx)
+            # 找到有两个及以上个体的模型
+            candidate_model_indices = [m for m, idxs in model_to_indices.items() if len(idxs) >= 2]
+            if not candidate_model_indices:
+                # 如果没有任何模型有两个及以上的个体，则为每次交叉随机生成一个与现有个体模型类型相同的新个体，与现有个体交叉
+                while len(next_gen) < population_size - elite_size:
+                    # 随机选一个现有个体
+                    p1 = random.choice(selected_population)
+                    # 获取其模型类型
+                    model_idx = p1[0] if len(p1) > 0 else 0
+                    # 随机生成一个模型类型相同的新个体
+                    p2 = p1.copy()
+                    # 除了模型类型外，其他基因随机生成
+                    for i in range(1, len(p2)):
+                        strategies = list(self.model_hyperparameters.values())[i-1] if i-1 < len(self.model_hyperparameters) else []
+                        if strategies:
+                            p2[i] = random.randint(0, len(strategies)-1)
+                    c1, c2 = self.crossover(p1, p2)
+                    next_gen.append(self.mutate(c1, mutation_rate))
+                    next_gen.append(self.mutate(c2, mutation_rate))
+            else:
+                while len(next_gen) < population_size - elite_size:
+                    # 随机选一个有两个及以上个体的模型
+                    model_idx = random.choice(candidate_model_indices)
+                    idxs = model_to_indices[model_idx]
+                    # 随机选两个不同的个体
+                    p1_idx, p2_idx = random.sample(idxs, 2)
+                    p1 = selected_population[p1_idx]
+                    p2 = selected_population[p2_idx]
+                    c1, c2 = self.crossover(p1, p2)
+                    next_gen.append(self.mutate(c1, mutation_rate))
+                    next_gen.append(self.mutate(c2, mutation_rate))
             
             population = next_gen[:population_size - elite_size] + elite
             
