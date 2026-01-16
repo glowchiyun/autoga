@@ -205,9 +205,13 @@ class Feature_selector():
             if self.verbose:
                 print('Error: Need at least one continuous variable for identifying the best subset of features')
             df = df_train
-        elif len(X.columns) < k:
+        elif len(X.columns) <= k:
+            if self.verbose:
+                print(f'Number of features ({len(X.columns)}) <= k ({k}), returning all features')
             return X
         else:
+            # 调整k值以确保不超过特征数量
+            k = min(k, len(X.columns))
             # Filter out negative variables
             negative_vars = X.columns[(X < 0).any()].tolist()
             if len(negative_vars) == len(X.columns):
@@ -225,6 +229,8 @@ class Feature_selector():
                         print("After removing negative variables, no features left for WR feature selection.")
                     df = df_train
                 else:
+                    # 再次检查并调整k值，因为可能移除了负值特征
+                    k = min(k, len(X.columns))
                     selector = SelectKBest(score_func=chi2, k=k)
                     selector.fit(X, df_target)
 

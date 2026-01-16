@@ -184,6 +184,80 @@ class GlobalEncoderManager:
             }
             
         return summary
+    
+    def get_state(self):
+        """
+        获取编码器的完整状态，用于保存和复用
+        
+        Returns:
+        --------
+        dict
+            包含所有编码器、配置信息和元数据的状态字典
+        """
+        state = {
+            'encoders': {},
+            'encoding_info': self.encoding_info.copy(),
+            'skipped_features': self.skipped_features.copy(),
+            'is_trained': self.is_trained,
+            'ratio_threshold': self.ratio_threshold,
+            'count_threshold': self.count_threshold
+        }
+        
+        # 序列化编码器对象
+        for col, encoder in self.encoders.items():
+            state['encoders'][col] = pickle.dumps(encoder)
+        
+        return state
+    
+    def load_state(self, state):
+        """
+        从保存的状态恢复编码器
+        
+        Parameters:
+        -----------
+        state : dict
+            由get_state()方法生成的状态字典
+        """
+        self.encoding_info = state['encoding_info'].copy()
+        self.skipped_features = state['skipped_features'].copy()
+        self.is_trained = state['is_trained']
+        self.ratio_threshold = state['ratio_threshold']
+        self.count_threshold = state['count_threshold']
+        
+        # 反序列化编码器对象
+        self.encoders = {}
+        for col, encoder_bytes in state['encoders'].items():
+            self.encoders[col] = pickle.loads(encoder_bytes)
+        
+        print(f"已恢复编码器状态: {len(self.encoders)}个编码器")
+    
+    def save_to_file(self, filepath):
+        """
+        保存编码器状态到文件
+        
+        Parameters:
+        -----------
+        filepath : str
+            保存路径
+        """
+        state = self.get_state()
+        with open(filepath, 'wb') as f:
+            pickle.dump(state, f)
+        print(f"编码器状态已保存到: {filepath}")
+    
+    def load_from_file(self, filepath):
+        """
+        从文件加载编码器状态
+        
+        Parameters:
+        -----------
+        filepath : str
+            保存路径
+        """
+        with open(filepath, 'rb') as f:
+            state = pickle.load(f)
+        self.load_state(state)
+        print(f"编码器状态已从文件加载: {filepath}")
 
 # 全局编码器实例
 global_encoder = GlobalEncoderManager()
