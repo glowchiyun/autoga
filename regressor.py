@@ -221,5 +221,5 @@ class Regressor:
             return fitness, self.trained_model  # 返回适应度（交叉验证平均分数）和训练好的模型
         except ValueError as e:
             print(f"Regression failed: {str(e)}")
-            return 0.0, None
+            return -np.inf, None  # 返回-inf而不是0.0，与其他地方保持一致
 

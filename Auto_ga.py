@@ -3,8 +3,6 @@ import logging
 import load_data as ld
 import numpy as np
 from joblib import Parallel, delayed
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import StandardScaler
 from scipy.stats import norm
 import regressor as rg
 import classifier as cl
@@ -15,6 +13,8 @@ import sys
 import os
 import pandas as pd
 import preprocessing as pre
+from range_adjuster import IntelligentRangeAdjuster
+from fitness_predictor import FitnessPredictor
 
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
@@ -65,311 +65,6 @@ except ImportError:
     # 如果log_config不存在，使用基本配置
     pass
 
-# 确保控制台输出也支持中文
-#if sys.stdout.encoding != 'utf-8':
-#    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
-#if sys.stderr.encoding != 'utf-8':
-#    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
-
-class IntelligentRangeAdjuster:
-    """基于高斯分布的自适应超参数范围调整器 - 方案2"""
-    
-    def __init__(self, adjustment_factor=0.5):
-        self.param_history = {}  # {model_param:[values], fitness:[scores]}
-        self.adjustment_factor = adjustment_factor  # 调整激进度(0-1)
-        self.adjustment_count = 0  # 调整次数统计
-        
-        # 定义常见超参数的合法范围约束
-        self.param_bounds = {
-            'colsample_bytree': (0, 1),
-            'subsample': (0, 1),
-            'learning_rate': (0.001, 1),
-            'gamma': (0, float('inf')),
-            'reg_alpha': (0, float('inf')),
-            'reg_lambda': (0, float('inf')),
-            'min_child_weight': (0, float('inf')),
-            'max_depth': (1, 50),
-            'n_estimators': (10, 1000),
-            'alpha': (0, float('inf')),
-            'l1_ratio': (0, 1),
-            'C': (0.001, float('inf')),
-        }
-    
-    def record_evaluation(self, model_name, param_name, param_value, fitness):
-        """记录每个超参数的评估结果"""
-        key = f"{model_name}_{param_name}"
-        if key not in self.param_history:
-            self.param_history[key] = {'values': [], 'fitness': []}
-        
-        self.param_history[key]['values'].append(param_value)
-        self.param_history[key]['fitness'].append(fitness)
-    
-    def _get_param_bounds(self, param_name, original_values):
-        """获取参数的合法范围约束
-        
-        :param param_name: 参数名称
-        :param original_values: 原始值列表
-        :return: (min_bound, max_bound)
-        """
-        # 如果有预定义的边界，使用预定义的
-        if param_name in self.param_bounds:
-            return self.param_bounds[param_name]
-        
-        # 否则从原始值推断
-        if not original_values:
-            return (0, float('inf'))
-        
-        min_val = min(original_values)
-        max_val = max(original_values)
-        
-        # 如果所有原始值都在[0,1]之间，假设这是一个比例参数
-        if max_val <= 1.0 and min_val >= 0:
-            return (0, 1)
-        
-        # 否则给一个宽松的范围
-        if min_val >= 0:
-            return (0, max_val * 3)  # 允许扩展到原最大值的3倍
-        else:
-            return (min_val * 3, max_val * 3)
-    
-    def compute_optimal_range(self, model_name, param_name, original_values):
-        """基于评估历史计算最优范围 - 改进版：在最优值周围生成新的搜索点
-        
-        :param model_name: 模型名称
-        :param param_name: 超参数名称
-        :param original_values: 原始参数范围列表
-        :return: 调整后的参数范围
-        """
-        key = f"{model_name}_{param_name}"
-        
-        if key not in self.param_history or not self.param_history[key]['values']:
-            return original_values
-        
-        values = np.array(self.param_history[key]['values'])
-        fitness = np.array(self.param_history[key]['fitness'])
-        
-        # 过滤失败的评估（-inf值）
-        valid_mask = fitness != -np.inf
-        if np.sum(valid_mask) < 3:
-            return original_values  # 样本过少，不调整
-        
-        values = values[valid_mask]
-        fitness = fitness[valid_mask]
-        
-        # 检查参数类型
-        # 1. 处理包含None的情况
-        has_none = None in original_values
-        numeric_originals = [v for v in original_values if v is not None and isinstance(v, (int, np.integer, float, np.floating))]
-        non_numeric = [v for v in original_values if not isinstance(v, (int, np.integer, float, np.floating))]
-        
-        # 2. 如果原始值中包含字符串等非数值（不包括None），则不调整
-        if non_numeric and not (len(non_numeric) == 1 and non_numeric[0] is None):
-            logging.debug(f"{model_name}.{param_name}: 包含非数值参数，跳过范围调整")
-            return original_values
-        
-        # 3. 提取历史中的数值参数
-        numeric_values = []
-        corresponding_fitness = []
-        for v, f in zip(values, fitness):
-            if v is not None and isinstance(v, (int, np.integer, float, np.floating)):
-                numeric_values.append(float(v))
-                corresponding_fitness.append(f)
-        
-        if len(numeric_values) < 3:
-            return original_values
-        
-        numeric_values = np.array(numeric_values)
-        corresponding_fitness = np.array(corresponding_fitness)
-        
-        # 找到表现最好的top 30%参数值
-        top_k = max(1, int(len(numeric_values) * 0.3))
-        top_indices = np.argsort(-corresponding_fitness)[:top_k]
-        best_values = numeric_values[top_indices]
-        
-        # 计算最优区域的中心和范围
-        optimal_center = np.mean(best_values)
-        optimal_std = np.std(best_values) if len(best_values) > 1 else np.std(numeric_values) * 0.5
-        optimal_std = max(optimal_std, 0.01)  # 防止std过小
-        
-        # 判断参数类型：整数还是浮点数
-        is_integer = all(isinstance(v, (int, np.integer)) for v in numeric_originals)
-        
-        # 获取参数的合法范围约束
-        param_min, param_max = self._get_param_bounds(param_name, numeric_originals)
-        
-        # 在最优中心周围生成新的搜索点
-        new_values = []
-        
-        # 保留最优的原始值
-        for v in numeric_originals:
-            if abs(v - optimal_center) <= 2 * optimal_std:
-                new_values.append(v)
-        
-        # 在最优区域生成新的候选值
-        if is_integer:
-            # 整数参数：在中心附近生成等间距的整数
-            min_val = max(param_min, int(optimal_center - 2 * optimal_std))
-            max_val = min(param_max, int(optimal_center + 2 * optimal_std))
-            step = max(1, (max_val - min_val) // 4)
-            candidates = list(range(min_val, max_val + 1, step))
-        else:
-            # 浮点数参数：在中心附近生成对数或线性间距的值
-            if optimal_center > 0.1:  # 使用对数空间
-                log_center = np.log10(optimal_center)
-                log_std = optimal_std / optimal_center  # 相对标准差
-                candidates = np.logspace(log_center - 2*log_std, log_center + 2*log_std, 5)
-            else:  # 使用线性空间
-                candidates = np.linspace(max(param_min, optimal_center - 2*optimal_std), 
-                                       min(param_max, optimal_center + 2*optimal_std), 5)
-            candidates = [round(v, 4) for v in candidates]
-            
-        # 合并并去重，同时确保在合法范围内
-        for c in candidates:
-            if is_integer:
-                c = int(c)
-            if c not in new_values and param_min <= c <= param_max:
-                new_values.append(c)
-        
-        # 如果新值太少，保留一些原始值
-        if len(new_values) < 3:
-            for v in sorted(numeric_originals):
-                if v not in new_values:
-                    new_values.append(v)
-                if len(new_values) >= 4:
-                    break
-        
-        # 如果原始值包含None，且None对应的特征表现也不错，则保留
-        if has_none:
-            none_fitness = [f for v, f in zip(values, fitness) if v is None]
-            if none_fitness and np.mean(none_fitness) > np.percentile(corresponding_fitness, 30):
-                new_values.insert(0, None)
-        
-        new_values = sorted([v for v in new_values if v is not None], key=float) + ([None] if None in new_values else [])
-        
-        # 确保新值与原始值有实质性差异，否则不调整
-        if set(new_values) == set(original_values):
-            return original_values
-        
-        logging.debug(f"{model_name}.{param_name}: 最优中心={optimal_center:.4f}, "
-                     f"std={optimal_std:.4f}, 新范围={new_values}")
-        
-        return new_values
-    
-    def suggest_new_values_in_range(self, model_name, param_name, original_values, expand=False):
-        """在最优值周围建议新的参数值
-        
-        :param model_name: 模型名称
-        :param param_name: 超参数名称
-        :param original_values: 原始参数范围
-        :param expand: 是否扩展搜索空间
-        :return: 建议的新参数范围
-        """
-        key = f"{model_name}_{param_name}"
-        
-        if key not in self.param_history or expand:
-            if expand:
-                # 扩展搜索空间
-                min_val = original_values[0]
-                max_val = original_values[-1]
-                step = (max_val - min_val) / (len(original_values) - 1) if len(original_values) > 1 else 1
-                expanded_range = np.arange(min_val - step, max_val + 2*step, step)
-                return [v for v in expanded_range if v >= 0]  # 移除负值
-            return original_values
-        
-        values = np.array(self.param_history[key]['values'])
-        fitness = np.array(self.param_history[key]['fitness'])
-        
-        valid_mask = fitness != -np.inf
-        if np.sum(valid_mask) == 0:
-            return original_values
-        
-        best_value = values[valid_mask][np.argmax(fitness[valid_mask])]
-        
-        # 在最优值周围生成新值
-        if isinstance(best_value, (int, np.integer)):
-            step = max(1, int(abs(original_values[-1] - original_values[0]) / 10))
-            new_range = [int(best_value - 2*step), int(best_value - step), int(best_value),
-                        int(best_value + step), int(best_value + 2*step)]
-            return [v for v in new_range if v > 0]
-        else:
-            step = abs(original_values[-1] - original_values[0]) / 10
-            return [float(best_value - 2*step), float(best_value - step), float(best_value),
-                   float(best_value + step), float(best_value + 2*step)]
-    
-    def should_adjust(self, current_gen, adjust_interval=5):
-        """判断是否应该调整范围
-        
-        :param current_gen: 当前代数
-        :param adjust_interval: 调整间隔（默认每5代调整一次）
-        :return: 是否应该调整
-        """
-        return current_gen > 0 and current_gen % adjust_interval == 0
-
-class FitnessPredictor:
-    def __init__(self):
-        self.model = RandomForestRegressor(n_estimators=50, random_state=42, max_depth=10)
-        self.scaler = StandardScaler()
-        self.is_trained = False
-        self.history = {
-            'chromosomes': [],
-            'fitnesses': []
-        }
-        self.min_samples_to_train = 50  # 降低到50而非100，使预测模型更早投入使用
-        
-    def add_history(self, chromosome, fitness):
-        """添加历史数据"""
-        self.history['chromosomes'].append(chromosome)
-        self.history['fitnesses'].append(fitness)
-        
-    def train(self):
-        """训练预测模型 - 改进版本，过滤失败样本并使用最近数据"""
-        if len(self.history['chromosomes']) < self.min_samples_to_train:
-            return False
-        
-        try:
-            # 为了稳定性，只使用最近的样本（滑动窗口）
-            recent_size = min(len(self.history['chromosomes']), 200)
-            X = np.array(self.history['chromosomes'][-recent_size:])
-            y = np.array(self.history['fitnesses'][-recent_size:])
-            
-            # 过滤掉失败的样本(-inf)
-            valid_mask = y != -np.inf
-            if np.sum(valid_mask) < self.min_samples_to_train:
-                return False
-            
-            X = X[valid_mask]
-            y = y[valid_mask]
-            
-            # 标准化特征
-            X = self.scaler.fit_transform(X)
-            
-            # 训练模型
-            self.model.fit(X, y)
-            self.is_trained = True
-            
-            # 记录模型性能
-            train_r2 = self.model.score(X, y)
-            logging.debug(f"预测模型训练完成，R²={train_r2:.4f}")
-            
-            return True
-        except Exception as e:
-            logging.error(f"预测模型训练失败: {str(e)}")
-            self.is_trained = False
-            return False
-        
-    def predict(self, chromosome):
-        """预测适应度"""
-        if not self.is_trained:
-            return None
-        
-        try:
-            X = np.array([chromosome])
-            X = self.scaler.transform(X)
-            prediction = self.model.predict(X)[0]
-            return prediction
-        except Exception as e:
-            logging.error(f"预测失败: {str(e)}")
-            return None
 
 class GeneticAlgorithm:
     def __init__(self, data, target, use_prediction=True, cv_scoring=None, enable_ensemble=False, enable_adaptive_range=True):
@@ -389,6 +84,7 @@ class GeneticAlgorithm:
         self.enable_adaptive_range = enable_adaptive_range  # 新增
         self.top_models = []  # 存储表现最好的模型
         self.ensemble_size = 5 # 集成模型数量
+        self.best_model_features = None  # 保存最佳模型的特征列
         self.prediction_threshold = 0.8  # 预测适应度阈值
         
         # 检测任务类型
@@ -674,7 +370,9 @@ class GeneticAlgorithm:
                 ).transform()
 
                 if self.enable_ensemble and model is not None and score > -np.inf:
-                    self.add_top_models(chromosome, score, model, processed_features=list(processed_data.columns))
+                    # 保存训练时使用的特征列（去除目标变量）
+                    train_features = [col for col in processed_data.columns if col != target]
+                    self.add_top_models(chromosome, score, model, processed_features=train_features)
 
                 return score, model
             else:  # classification tasks
@@ -687,7 +385,9 @@ class GeneticAlgorithm:
                 ).transform()
 
                 if self.enable_ensemble and model is not None and score > -np.inf:
-                    self.add_top_models(chromosome, score, model, processed_features=list(processed_data.columns))
+                    # 保存训练时使用的特征列（去除目标变量）
+                    train_features = [col for col in processed_data.columns if col != target]
+                    self.add_top_models(chromosome, score, model, processed_features=train_features)
                 return score, model
         except Exception as e:
             logging.error(f"Fitness calculation error: {str(e)}")
@@ -702,12 +402,24 @@ class GeneticAlgorithm:
             if self.use_prediction and self.fitness_predictor.is_trained:
                 predicted_fitness = self.fitness_predictor.predict(chromo)
                 if predicted_fitness is not None:
-                    # 计算评估概率：基于预测分数与最佳分数的差距
-                    if self.best_score > -np.inf:
-                        gap = self.best_score - predicted_fitness
-                        # 最小10%概率确保探索，最大100%概率用于高分个体
-                        eval_probability = 1.0 - (gap / (abs(self.best_score) + 1e-10))
-                        eval_probability = np.clip(eval_probability, 0.1, 1.0)
+                    # 改进：使用归一化的差距，避免负分数时的异常行为
+                    if self.best_score > -np.inf and len(self.fitness_predictor.history['fitnesses']) > 1:
+                        # 获取历史分数并过滤-inf
+                        valid_scores = [s for s in self.fitness_predictor.history['fitnesses'] if s != -np.inf]
+                        if len(valid_scores) > 1:
+                            # 计算分数范围用于归一化
+                            score_range = max(valid_scores) - min(valid_scores)
+                            if score_range > 1e-10:
+                                # 归一化差距到[0, 1]
+                                normalized_gap = (self.best_score - predicted_fitness) / score_range
+                                # 转换为评估概率：差距越大，评估概率越低
+                                eval_probability = 1.0 - np.clip(normalized_gap, 0, 0.9)
+                                eval_probability = np.clip(eval_probability, 0.1, 1.0)
+                            else:
+                                # 分数范围太小，全部评估
+                                eval_probability = 1.0
+                        else:
+                            eval_probability = 1.0
                     else:
                         eval_probability = 1.0  # 初期全部评估
                     
@@ -759,12 +471,16 @@ class GeneticAlgorithm:
         :param generation: 当前代数
         """
         if not self.enable_adaptive_range or self.range_adjuster is None:
+            logging.debug(f"第{generation}代：超参数调整功能未启用")
             return
         
         if not self.range_adjuster.should_adjust(generation, adjust_interval=5):
+            logging.debug(f"第{generation}代：不满足调整间隔条件，跳过调整")
             return
         
+        logging.info(f"\n{'='*50}")
         logging.info(f"第{generation}代：开始自动调整超参数范围")
+        logging.info(f"{'='*50}")
         
         adjusted_count = 0
         for model_name in list(self.model_hyperparameters.keys()):
@@ -779,12 +495,20 @@ class GeneticAlgorithm:
                 # 如果范围有变化，则更新
                 if new_values != original_values:
                     self.model_hyperparameters[model_name][param_name] = new_values
-                    logging.info(f"  {model_name}.{param_name}: {original_values} → {new_values}")
+                    logging.info(f"  ✓ {model_name}.{param_name}:")
+                    logging.info(f"    原范围: {original_values}")
+                    logging.info(f"    新范围: {new_values}")
                     adjusted_count += 1
         
         if adjusted_count > 0:
-            logging.info(f"共调整{adjusted_count}个超参数范围")
+            logging.info(f"{'='*50}")
+            logging.info(f"✓ 本次调整完成：共调整了 {adjusted_count} 个超参数范围")
+            logging.info(f"✓ 累计调整次数：{self.range_adjuster.adjustment_count + 1}")
+            logging.info(f"{'='*50}\n")
             self.range_adjuster.adjustment_count += 1
+        else:
+            logging.info(f"本次检查：所有超参数范围均未发生变化")
+            logging.info(f"{'='*50}\n")
     
     def run(self, generations=20, population_size=50, mutation_rate=0.2, 
             elite_size=2, n_jobs=-1, time_limit=None, tournament_size=3):
@@ -839,6 +563,8 @@ class GeneticAlgorithm:
                     best_score = score
                     best_config = chromo
                     best_model = model
+                    # 保存最佳模型的特征列（去除目标变量）
+                    self.best_model_features = [col for col in data.columns if col != target]
             
             self.best_score = best_score
             avg_fitness = np.mean(scores) if scores else -np.inf
@@ -848,6 +574,11 @@ class GeneticAlgorithm:
             # 选择精英个体
             elite = sorted(zip(scores, valid_pop), key=lambda x: x[0], reverse=True)[:elite_size]
             elite = [c for (s, c) in elite]
+
+            # 先调整超参数范围，再生成子代
+            # 这样新种群可以使用调整后的范围
+            if self.enable_adaptive_range and (gen + 1) % 5 == 0:
+                self.adjust_hyperparameter_ranges(gen + 1)
 
             # 使用锦标赛选择
             selected_population = self.tournament_selection(valid_pop, scores, tournament_size)
@@ -873,13 +604,18 @@ class GeneticAlgorithm:
                     p1 = random.choice(selected_population)
                     # 获取其模型类型
                     model_idx = p1[0] if len(p1) > 0 else 0
+                    model_name = models[model_idx] if model_idx < len(models) else models[0]
+                    model_params = self.model_hyperparameters.get(model_name, {})
                     # 随机生成一个模型类型相同的新个体
                     p2 = p1.copy()
-                    # 除了模型类型外，其他基因随机生成
+                    # 除了模型类型外，其他超参数基因随机生成
+                    param_keys = list(model_params.keys())
                     for i in range(1, len(p2)):
-                        strategies = list(self.model_hyperparameters.values())[i-1] if i-1 < len(self.model_hyperparameters) else []
-                        if strategies:
-                            p2[i] = random.randint(0, len(strategies)-1)
+                        param_idx = i - 1
+                        if param_idx < len(param_keys):
+                            param_values = model_params[param_keys[param_idx]]
+                            if param_values:
+                                p2[i] = random.randint(0, len(param_values) - 1)
                     c1, c2 = self.crossover(p1, p2)
                     next_gen.append(self.mutate(c1, mutation_rate))
                     next_gen.append(self.mutate(c2, mutation_rate))
@@ -897,9 +633,6 @@ class GeneticAlgorithm:
                     next_gen.append(self.mutate(c2, mutation_rate))
             
             population = next_gen[:population_size - elite_size] + elite
-            
-            # 【新增】自动调整超参数范围
-            self.adjust_hyperparameter_ranges(gen)
             
             # 直接使用原始适应度值记录历史
             history.append(best_score)
@@ -933,6 +666,7 @@ class GeneticAlgorithm:
             'config': config,
             'model_name': f"model_{len(self.top_models)}_{model_type}",
             'estimator_type': 'regressor' if self.task_type == 'regression' else 'classifier',
+            'feature_columns': processed_features if processed_features else [],  # 保存训练时的特征列
         }
         # 查找是否有相同模型类型
         same_type_idx = next((i for i, m in enumerate(self.top_models) if m['config']['model'] == model_type), None)
@@ -975,11 +709,27 @@ class GeneticAlgorithm:
                     if self.target in X_input.columns:
                         X_input = X_input.drop(columns=[self.target])
                     
-                    # 确保只使用数值特征，过滤掉所有非数值列
-                    X_input = X_input.select_dtypes(include=[np.number])
+                    # 使用训练时保存的特征列，确保特征一致性
+                    if 'feature_columns' in model_info and model_info['feature_columns']:
+                        expected_features = model_info['feature_columns']
+                        # 只选择存在且为数值类型的特征
+                        available_features = []
+                        for feat in expected_features:
+                            if feat in X_input.columns and pd.api.types.is_numeric_dtype(X_input[feat]):
+                                available_features.append(feat)
+                        
+                        if not available_features:
+                            logging.warning(f"模型 {model_name} 没有可用的数值特征，跳过此模型")
+                            continue
+                        
+                        X_input = X_input[available_features]
+                    
+                    else:
+                        # fallback：使用数值特征
+                        X_input = X_input.select_dtypes(include=[np.number])
                     
                     if X_input.empty:
-                        logging.error(f"模型 {model_name} 没有可用的数值特征")
+                        logging.error(f"模型 {model_name} 没有可用的特征")
                         continue
                     
                     pred = model.predict(X_input)
@@ -1037,9 +787,9 @@ if __name__ == "__main__":
     import load_data as ld
     from sklearn.model_selection import train_test_split
     data = ld.load_data("datasets/titanic_train.csv")
-    target = "Survived"
+    target = "Fare"
     
-    # ✅ 修复数据泄露问题：先分割数据，确保测试集不参与任何训练过程
+    # 使用训练时保存的特征列，确保特征一致性
     train_data, test_data = train_test_split(data, test_size=0.4, random_state=42)
     print(f"数据分割: 训练集={len(train_data)}行, 测试集={len(test_data)}行")
     
@@ -1055,7 +805,7 @@ if __name__ == "__main__":
     
     # 2. 用处理后的训练集做模型/超参数搜索
     ga_ensemble = GeneticAlgorithm(
-        data=processed_train,  # ✅ 只使用训练集
+        data=processed_train,  # 使用训练集
         target=target,
         use_prediction=True, 
         enable_ensemble=True 
@@ -1080,8 +830,32 @@ if __name__ == "__main__":
             if target in processed_test.columns:
                 y_true = processed_test[target]
                 X_test = processed_test.drop(columns=[target])
-            # 确保所有特征都是数值类型
-            X_test = X_test.select_dtypes(include=[np.number])
+            
+            # 使用训练时保存的特征列，确保特征一致性
+            if ga_ensemble.best_model_features:
+                expected_features = ga_ensemble.best_model_features
+                # 只选择测试集中存在且为数值类型的特征
+                available_features = []
+                for feat in expected_features:
+                    if feat in X_test.columns:
+                        # 检查是否为数值类型
+                        if pd.api.types.is_numeric_dtype(X_test[feat]):
+                            available_features.append(feat)
+                        else:
+                            print(f"警告: 特征 '{feat}' 存在但不是数值类型，已跳过")
+                    else:
+                        print(f"警告: 特征 '{feat}' 在测试集中不存在，已跳过")
+                
+                if not available_features:
+                    print(f"错误: 没有可用的数值特征")
+                    raise ValueError("测试集中没有可用的训练特征")
+                
+                X_test = X_test[available_features]
+                print(f"使用训练特征: {len(available_features)}/{len(expected_features)}个特征")
+            else:
+                # fallback：使用数值特征
+                X_test = X_test.select_dtypes(include=[np.number])
+                print(f"警告: 未找到保存的特征列，使用数值特征: {X_test.shape[1]}个")
             
             # 进行预测
             y_pred = best_model.predict(X_test)

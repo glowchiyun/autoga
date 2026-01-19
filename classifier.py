@@ -201,7 +201,9 @@ class Classifier:
             learning_rate=self.hyperparams.get('learning_rate', 0.1),
             subsample=self.hyperparams.get('subsample', 1.0),
             colsample_bytree=self.hyperparams.get('colsample_bytree', 1.0),
-            random_state=42
+            random_state=42,
+            n_jobs=1,  # 避免并行时的警告
+            verbosity=0  # 抑制XGBoost的警告信息
         )
         # 执行交叉验证
         cv_scores = cross_val_score(model, X, y, cv=self.cv_folds, scoring=self.cv_scoring)
@@ -276,4 +278,4 @@ class Classifier:
             return fitness, self.trained_model  # 返回适应度（交叉验证平均分数）和训练好的模型
         except ValueError as e:
             print(f"Classification failed: {str(e)}")
-            return 0.0, None
+            return -np.inf, None  # 返回-inf而不是0.0，与其他地方保持一致

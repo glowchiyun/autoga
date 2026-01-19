@@ -287,7 +287,7 @@ class Preprocessing:
                     preprocessing_log.append(f"缺失值处理: {preprocessing_plan['imputer']}")
                 except Exception as e:
                     logging.error(f"缺失值处理失败: {str(e)}")
-                    X = X.fillna(method='ffill').fillna(method='bfill')
+                    X = X.ffill().bfill()  # 使用新的API替代废弃的fillna(method=)
                     preprocessing_log.append("缺失值处理: 使用前向填充")
             
             # 2. 异常值检测和处理
