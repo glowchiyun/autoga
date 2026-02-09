@@ -44,6 +44,10 @@ class Feature_selector():
         self.threshold = threshold
 
         self.verbose = verbose
+        
+        # 用于保存训练时选择的特征列表
+        self.selected_features_ = None
+        self.is_fitted_ = False
 
     def get_params(self, deep=True):
 
@@ -337,16 +341,60 @@ class Feature_selector():
 
         return df
 
-    def transform(self):
-        df = self.dataset.copy()
-        df1 = df.drop(self.target,axis=1)
+    def transform(self, new_data=None):
+        """
+        特征选择
+        
+        Parameters
+        ----------
+        new_data : pd.DataFrame, optional
+            如果提供，则使用训练时保存的特征列表过滤新数据（测试集）
+            如果不提供，则进行特征选择并保存结果（训练集）
+            
+        Returns
+        -------
+        pd.DataFrame
+            特征选择后的数据
+        """
+        # 判断是训练阶段还是测试阶段
+        fit_mode = (new_data is None)
+        df = self.dataset.copy() if fit_mode else new_data.copy()
+        
+        # 测试阶段：直接使用保存的特征列表
+        if not fit_mode and self.selected_features_ is not None:
+            print()
+            print(">>Feature selection (Testing - using saved features)")
+            print("Before feature selection:")
+            print(df.shape[1], "features")
+            
+            # 只保留训练时选择的特征
+            available_features = [f for f in self.selected_features_ if f in df.columns]
+            missing_features = set(self.selected_features_) - set(df.columns)
+            
+            if missing_features:
+                print(f"Warning: {len(missing_features)} features not found in test data: {missing_features}")
+            
+            df = df[available_features]
+            
+            print("After feature selection:")
+            print(len(available_features), "features remain")
+            print(available_features)
+            print()
+            return df
+        
+        # 训练阶段：执行特征选择并保存结果
+        # 修复：只有当target列存在时才drop
+        if self.target in df.columns:
+            df1 = df.drop(self.target, axis=1)
+        else:
+            df1 = df.copy()
         start_time = time.time()
 
         to_keep = []
 
         print()
 
-        print(">>Feature selection ")
+        print(">>Feature selection (Training)")
 
         print("Before feature selection:")
         print(df1.shape[1], "features ")
@@ -408,7 +456,9 @@ class Feature_selector():
                 dn = df.copy()
 
         to_keep = [column for column in dn.columns]
-        to_keep.append(self.target)
+        # 只在target存在于df中时才添加到to_keep
+        if self.target in df.columns:
+            to_keep.append(self.target)
         df=df[to_keep]
         print(df.columns)
 
@@ -417,5 +467,12 @@ class Feature_selector():
         print(to_keep)
         print("Feature selection done -- CPU time: %s seconds" % (time.time() - start_time))
         print()
+        
+        # 保存选择的特征列表（包括 target）
+        if fit_mode:
+            self.selected_features_ = to_keep
+            self.is_fitted_ = True
+            if self.verbose:
+                print(f"Saved selected features: {self.selected_features_}")
 
         return df

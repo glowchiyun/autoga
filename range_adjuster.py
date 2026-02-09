@@ -9,15 +9,18 @@ import logging
 class IntelligentRangeAdjuster:
     """基于高斯分布的自适应超参数范围调整器"""
     
-    def __init__(self, adjustment_factor=0.5):
+    def __init__(self, adjustment_factor=0.5, max_adjustments=4):
         self.param_history = {}  # {model_param:[values], fitness:[scores]}
         self.adjustment_factor = adjustment_factor  # 调整激进度(0-1)
         self.adjustment_count = 0  # 调整次数统计
+        self.max_adjustments = max_adjustments  # 最大调整次数，防止搜索空间过度收缩
+        self.original_ranges = {}  # 保存初始参数范围，用于保持多样性
         
         # 定义常见超参数的合法范围约束
         self.param_bounds = {
-            'colsample_bytree': (0, 1),
-            'subsample': (0, 1),
+            # XGBoost/LightGBM/CatBoost参数
+            'colsample_bytree': (0.1, 1),
+            'subsample': (0.1, 1),
             'learning_rate': (0.001, 1),
             'gamma': (0, float('inf')),
             'reg_alpha': (0, float('inf')),
@@ -25,9 +28,30 @@ class IntelligentRangeAdjuster:
             'min_child_weight': (0, float('inf')),
             'max_depth': (1, 50),
             'n_estimators': (10, 1000),
+            'iterations': (10, 1000),  # CatBoost的迭代次数，必须>=10
+            'depth': (1, 16),  # CatBoost的深度
+            'l2_leaf_reg': (0, float('inf')),
+            'border_count': (1, 255),  # CatBoost的边界数量
+            # sklearn通用参数
+            'min_samples_split': (2, float('inf')),  # 必须>=2
+            'min_samples_leaf': (1, float('inf')),   # 必须>=1
+            'min_weight_fraction_leaf': (0.0, 0.5),  # [0, 0.5]
+            'max_features': (0.0, 1.0),  # 当为float时
+            'max_leaf_nodes': (2, float('inf')),  # 必须>=2
+            'min_impurity_decrease': (0.0, float('inf')),
+            # 线性模型参数
             'alpha': (0, float('inf')),
             'l1_ratio': (0, 1),
             'C': (0.001, float('inf')),
+            'tol': (1e-6, 1e-1),
+            'epsilon': (0, float('inf')),
+            # SVM参数
+            'coef0': (-1, 1),
+            # 其他
+            'ccp_alpha': (0.0, float('inf')),
+            'max_iter': (50, 2000),  # 训练迭代次数，必须>=50
+            'num_leaves': (2, 256),  # LightGBM叶子数，必须>=2
+            'min_child_samples': (1, 100),  # LightGBM最小子样本数
         }
     
     def record_evaluation(self, model_name, param_name, param_value, fitness):
@@ -61,14 +85,17 @@ class IntelligentRangeAdjuster:
         if max_val <= 1.0 and min_val >= 0:
             return (0, 1)
         
-        # 否则给一个宽松的范围
-        if min_val >= 0:
-            return (0, max_val * 3)  # 允许扩展到原最大值的3倍
+        # 对于正值参数，保守地使用原始值范围的扩展
+        # 防止生成不合理的0值（如 max_iter=0）
+        if min_val > 0:
+            return (max(1, int(min_val * 0.3)), int(max_val * 2))
+        elif min_val >= 0:
+            return (0, max_val * 3)
         else:
             return (min_val * 3, max_val * 3)
     
     def compute_optimal_range(self, model_name, param_name, original_values):
-        """基于评估历史计算最优范围 - 改进版：在最优值周围生成新的搜索点
+        """基于评估历史计算最优范围 - 改进版：防止过度收缩，保持多样性
         
         :param model_name: 模型名称
         :param param_name: 超参数名称
@@ -77,10 +104,19 @@ class IntelligentRangeAdjuster:
         """
         key = f"{model_name}_{param_name}"
         
+        # 已达到最大调整次数，不再调整（防止搜索空间崩溃）
+        if self.adjustment_count >= self.max_adjustments:
+            return original_values
+        
+        # 保存初始范围（第一次见到时记录）
+        if key not in self.original_ranges:
+            self.original_ranges[key] = list(original_values)
+        
         if key not in self.param_history or not self.param_history[key]['values']:
             return original_values
         
-        values = np.array(self.param_history[key]['values'])
+        # 修复：不能直接转换为numpy数组，因为可能包含元组等复杂类型
+        raw_values = self.param_history[key]['values']
         fitness = np.array(self.param_history[key]['fitness'])
         
         # 过滤失败的评估（-inf值）
@@ -88,25 +124,33 @@ class IntelligentRangeAdjuster:
         if np.sum(valid_mask) < 3:
             return original_values  # 样本过少，不调整
         
-        values = values[valid_mask]
+        # 使用列表而不是numpy数组来处理可能包含元组的情况
+        values = [raw_values[i] for i in range(len(raw_values)) if valid_mask[i]]
         fitness = fitness[valid_mask]
         
         # 检查参数类型
         # 1. 处理包含None的情况
         has_none = None in original_values
-        numeric_originals = [v for v in original_values if v is not None and isinstance(v, (int, np.integer, float, np.floating))]
-        non_numeric = [v for v in original_values if not isinstance(v, (int, np.integer, float, np.floating))]
+        numeric_originals = [v for v in original_values if v is not None and isinstance(v, (int, np.integer, float, np.float64))]
+        non_numeric = [v for v in original_values if not isinstance(v, (int, np.integer, float, np.float64))]
         
-        # 2. 如果原始值中包含字符串等非数值（不包括None），则不调整
+        # 2. 如果原始值中包含字符串、元组等非数值（不包括None），则不调整
+        # 元组类型（如hidden_layer_sizes）不适合做范围调整
         if non_numeric and not (len(non_numeric) == 1 and non_numeric[0] is None):
+            # 检查是否包含元组或其他复杂类型
+            has_complex_type = any(isinstance(v, (tuple, list)) for v in non_numeric if v is not None)
+            if has_complex_type:
+                logging.debug(f"{model_name}.{param_name}: 包含元组/列表类型参数，跳过范围调整")
+                return original_values
             logging.debug(f"{model_name}.{param_name}: 包含非数值参数，跳过范围调整")
             return original_values
         
-        # 3. 提取历史中的数值参数
+        # 3. 提取历史中的数值参数（跳过元组等复杂类型）
         numeric_values = []
         corresponding_fitness = []
         for v, f in zip(values, fitness):
-            if v is not None and isinstance(v, (int, np.integer, float, np.floating)):
+            # 跳过None、元组、列表等复杂类型
+            if v is not None and isinstance(v, (int, np.integer, float, np.float64)) and not isinstance(v, (tuple, list)):
                 numeric_values.append(float(v))
                 corresponding_fitness.append(f)
         
@@ -165,12 +209,25 @@ class IntelligentRangeAdjuster:
             if c not in new_values and param_min <= c <= param_max:
                 new_values.append(c)
         
-        # 如果新值太少，保留一些原始值
-        if len(new_values) < 3:
+        # 多样性保护：始终保留至少1/3的原始值（包括边界值），防止搜索空间过度收缩
+        initial_values = self.original_ranges.get(key, numeric_originals)
+        initial_numeric = [v for v in initial_values if v is not None and isinstance(v, (int, np.integer, float, np.float64))]
+        min_keep = max(2, len(initial_numeric) // 3)
+        
+        # 优先保留原始范围的边界值（最大/最小），维持搜索宽度
+        boundary_values = []
+        if initial_numeric:
+            boundary_values = [min(initial_numeric), max(initial_numeric)]
+            for bv in boundary_values:
+                if bv not in new_values and param_min <= bv <= param_max:
+                    new_values.append(bv)
+        
+        # 如果新值太少，从原始值补充
+        if len(new_values) < max(3, min_keep):
             for v in sorted(numeric_originals):
                 if v not in new_values:
                     new_values.append(v)
-                if len(new_values) >= 4:
+                if len(new_values) >= max(4, min_keep):
                     break
         
         # 如果原始值包含None，且None对应的特征表现也不错，则保留

@@ -73,7 +73,7 @@ class Outlier_detector():
 
         X = dataset.select_dtypes(['number'])
 
-        Y = dataset.select_dtypes(['object'])
+        Y = dataset.select_dtypes(exclude=['number'])
 
         if len(X.columns) < 1:
 
@@ -130,7 +130,7 @@ class Outlier_detector():
 
         X = dataset.select_dtypes(['number'])
 
-        Y = dataset.select_dtypes(['object'])
+        Y = dataset.select_dtypes(exclude=['number'])
 
         median = X.apply(np.median, axis=0)
 
@@ -186,7 +186,7 @@ class Outlier_detector():
 
         X = dataset.select_dtypes(['number'])
 
-        Y = dataset.select_dtypes(['object'])
+        Y = dataset.select_dtypes(exclude=['number'])
         
         k = int(threshold * 100)
 

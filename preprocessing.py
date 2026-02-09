@@ -14,7 +14,7 @@ import numpy as np
 from sklearn.model_selection import cross_val_score
 
 class Preprocessing:
-    def __init__(self, data, target, generations=10, population_size=10, mutation_rate=0.2, elite_size=2):
+    def __init__(self, data, target, generations=10, population_size=10, mutation_rate=0.2, elite_size=2, time_limit=None, cv_scoring=None):
         self.data = data
         self.target = target
         self.task_type,target_encoder = self.detect_task_type(data, target)
@@ -22,37 +22,56 @@ class Preprocessing:
         self.population_size = population_size
         self.mutation_rate = mutation_rate
         self.elite_size = elite_size
+        self.time_limit = time_limit  # 时间限制（秒）
+        self._start_time = None  # 运行开始时间
+        
+        # 评分指标：优先使用外部传入的，否则根据任务类型自动确定
+        if cv_scoring is not None:
+            self.cv_scoring = cv_scoring
+        elif self.task_type == 'binary_classification':
+            self.cv_scoring = 'roc_auc'
+        elif self.task_type == 'multiclass_classification':
+            self.cv_scoring = 'neg_log_loss'
+        else:
+            self.cv_scoring = 'neg_mean_squared_error'
+        logging.info(f"Preprocessing cv_scoring: {self.cv_scoring} (task_type={self.task_type})")
+        
         enc.global_encoder.train_on_data(data, ratio_threshold=0.5, count_threshold=8)
         self.preprocessing_steps = self._get_default_preprocessing_steps()
         self.pre_len = len(self.preprocessing_steps)
         self.best_plan = None
+        self.training_features_ = None  # 记录训练时的特征列名
         self.best_score = -float('inf')
         self.history = []
+        
+        # 保存已训练的预处理器实例（用于测试集转换）
+        self.fitted_preprocessors_ = {}
 
     def _get_default_preprocessing_steps(self):
+        # 移除可能导致卡住的慢速算法（EM, MICE, KNN）
         if self.task_type == 'regression':
             return {
-                'normalizer': ['', 'ZS', 'DS', 'Log10', 'MM'],
-                'imputer': ['EM', 'MICE', 'MF', 'MEDIAN', 'RAND'],
-                'outliers': ['', 'ZSB', 'IQR'],
-                'duplicate_detector': ['', 'ED'],
-                'feature_selector': ['', 'MR', 'VAR', 'LC', 'L1', 'IMP'],
+                'normalizer': ['', 'ZS', 'MM'],  # 简化
+                'imputer': ['MF', 'MEDIAN', 'RAND'],  # 移除 EM, MICE
+                'outliers': ['', 'IQR'],  # 简化
+                'duplicate_detector': [''],  # 简化
+                'feature_selector': ['', 'MR', 'VAR'],  # 简化
             }
         elif self.task_type == 'binary_classification':
             return {
-                'normalizer': ['', 'ZS', 'DS', 'Log10', 'MM'],
-                'imputer': ['EM', 'MICE', 'MF', 'MEDIAN', 'RAND'],
-                'outliers': ['', 'ZSB', 'IQR'],
-                'duplicate_detector': ['', 'ED'],
-                'feature_selector': ['', 'MR', 'VAR', 'LC', 'Tree', 'WR'],
+                'normalizer': ['', 'ZS', 'MM'],
+                'imputer': ['MF', 'MEDIAN', 'RAND'],
+                'outliers': ['', 'IQR'],
+                'duplicate_detector': [''],
+                'feature_selector': ['', 'MR', 'VAR'],
             }
         else:  # multiclass_classification
             return {
-                'normalizer': ['', 'ZS', 'DS', 'Log10', 'MM'],
-                'imputer': ['EM', 'MICE', 'MF', 'MEDIAN', 'RAND'],
-                'outliers': ['', 'ZSB', 'IQR'],
-                'duplicate_detector': ['', 'ED'],
-                'feature_selector': ['', 'MR', 'VAR', 'LC', 'Tree', 'WR'],
+                'normalizer': ['', 'ZS', 'MM'],
+                'imputer': ['MF', 'MEDIAN', 'RAND'],
+                'outliers': ['', 'IQR'],
+                'duplicate_detector': [''],
+                'feature_selector': ['', 'MR', 'VAR'],
             }
 
     def initialize_population(self):
@@ -104,53 +123,97 @@ class Preprocessing:
             selected.append(population[winner_idx])
         return selected
 
+    def _is_timeout(self):
+        """检查是否已超时"""
+        if self.time_limit is None or self._start_time is None:
+            return False
+        import time as _time
+        return (_time.time() - self._start_time) > self.time_limit
+
     def fitness_function(self, chromo):
+        # 检查超时 - 在每次 fitness 评估前检查
+        if self._is_timeout():
+            return -float('inf')
         plan = self.decode_chromosome(chromo)
         try:
             X = self.data.copy()
             processed_data = self.execute_preprocessing_plan(X, self.target, plan)
             if self.task_type == 'regression':
-                score, _ = rg.Regressor(
+                score, _, _ = rg.Regressor(
                     dataset=processed_data,
                     target=self.target,
+                    cv_folds=2,  # 减少CV折数以加速
+                    cv_scoring=self.cv_scoring,  # 使用与GA搜索一致的评分指标
                 ).transform()
             elif self.task_type == 'binary_classification':
-                score, _ = cl.Classifier(
+                score, _, _ = cl.Classifier(
                     dataset=processed_data,
                     target=self.target,
+                    cv_folds=2,  # 减少CV折数以加速
+                    cv_scoring=self.cv_scoring,  # 使用与GA搜索一致的评分指标
                 ).transform()
             else:
-                score, _ = cl.Classifier(
+                score, _, _ = cl.Classifier(
                     dataset=processed_data,
                     target=self.target,
+                    cv_folds=2,  # 减少CV折数以加速
+                    cv_scoring=self.cv_scoring,  # 使用与GA搜索一致的评分指标
                 ).transform()
             return score
         except Exception as e:
             return -float('inf')
 
     def run(self):
+        import time as _time
+        self._start_time = _time.time()  # 记录开始时间
         population = self.initialize_population()
         best_plan = None
         best_score = -float('inf')
+        
         for gen in range(self.generations):
-            fitnesses = [self.fitness_function(chromo) for chromo in population]
-            self.history.append(max(fitnesses))
+            # 检查时间限制
+            if self._is_timeout():
+                logging.info(f"预处理达到时间限制 {self.time_limit}秒，提前结束 (第{gen}代)")
+                break
+            
+            # 评估种群时也检查超时
+            fitnesses = []
+            for chromo in population:
+                if self._is_timeout():
+                    fitnesses.append(-float('inf'))  # 超时则跳过剩余评估
+                else:
+                    fitnesses.append(self.fitness_function(chromo))
+            
+            # 记录历史
+            valid_fitnesses = [f for f in fitnesses if f > -float('inf')]
+            if valid_fitnesses:
+                self.history.append(max(valid_fitnesses))
+            
+            # 选择精英
             elite = sorted(zip(fitnesses, population), key=lambda x: x[0], reverse=True)[:self.elite_size]
             elite = [c for (s, c) in elite]
+            
             selected = self.tournament_selection(population, fitnesses)
             next_gen = []
             while len(next_gen) < self.population_size - self.elite_size:
+                # 确保有足够的候选者
+                if len(selected) < 2:
+                    break
                 p1, p2 = random.sample(selected, 2)
                 c1, c2 = self.crossover(p1, p2)
                 next_gen.append(self.mutate(c1))
                 next_gen.append(self.mutate(c2))
             population = next_gen[:self.population_size - self.elite_size] + elite
+            
             max_idx = np.argmax(fitnesses)
             if fitnesses[max_idx] > best_score:
                 best_score = fitnesses[max_idx]
                 best_plan = population[max_idx]
-        self.best_plan = self.decode_chromosome(best_plan)
+        
+        self.best_plan = self.decode_chromosome(best_plan) if best_plan else self.decode_chromosome(population[0])
         self.best_score = best_score
+        elapsed = _time.time() - self._start_time
+        logging.info(f"预处理完成: 最佳分数={best_score:.4f}, 耗时={elapsed:.1f}秒")
         return self.best_plan, self.best_score
 
     def get_processed_data(self):
@@ -158,7 +221,12 @@ class Preprocessing:
         if self.best_plan is None:
             raise ValueError("请先运行run()方法找到最佳预处理方案")
         Xy = self.data.copy()
-        Xy = self.execute_preprocessing_plan(Xy, self.target, self.best_plan)
+        Xy = self.execute_preprocessing_plan(Xy, self.target, self.best_plan, is_training=True)
+        
+        # 保存训练时的特征列表，用于测试时的特征对齐
+        self.training_features_ = [col for col in Xy.columns if col != self.target]
+        logging.info(f"Saved training features: {len(self.training_features_)} columns")
+        
         return Xy
     
     def transform(self, new_data):
@@ -192,10 +260,43 @@ class Preprocessing:
         transformed_data = self.execute_preprocessing_plan(
             new_data.copy(), 
             self.target, 
-            self.best_plan
+            self.best_plan,
+            is_training=False  # 测试阶段，使用保存的预处理器状态
         )
         
         logging.info(f"已使用最佳预处理方案转换新数据: {len(new_data)}行 -> {len(transformed_data)}行")
+        
+        # 特征对齐：确保测试集特征与训练集一致
+        if hasattr(self, 'training_features_') and self.training_features_:
+            feature_cols = [col for col in transformed_data.columns if col != self.target]
+            
+            # 检查是否存在特征不一致
+            missing_features = set(self.training_features_) - set(feature_cols)
+            extra_features = set(feature_cols) - set(self.training_features_)
+            
+            if missing_features or extra_features:
+                logging.warning(f"特征不一致 - 缺失: {missing_features}, 多余: {extra_features}")
+                
+                # 添加缺失的特征（用0填充）
+                for col in missing_features:
+                    transformed_data[col] = 0
+                
+                # 移除多余的特征
+                for col in extra_features:
+                    if col in transformed_data.columns:
+                        transformed_data = transformed_data.drop(columns=[col])
+                
+                # 重新排序特征以匹配训练时的顺序
+                final_cols = self.training_features_.copy()
+                if self.target in transformed_data.columns:
+                    final_cols.append(self.target)
+                
+                # 只保留存在的列
+                final_cols = [col for col in final_cols if col in transformed_data.columns]
+                transformed_data = transformed_data[final_cols]
+                
+                logging.info(f"特征已对齐: {len(final_cols)} 列")
+
         return transformed_data
     
     def detect_task_type(self, data, target):
@@ -255,7 +356,7 @@ class Preprocessing:
             logging.error(f"任务类型检测失败: {str(e)}")
             return 'regression', None   
         
-    def execute_preprocessing_plan(self, data, target, preprocessing_plan):
+    def execute_preprocessing_plan(self, data, target, preprocessing_plan, is_training=True):
         """
         执行预处理计划
         
@@ -267,6 +368,8 @@ class Preprocessing:
             目标变量名
         preprocessing_plan : dict
             预处理计划配置
+        is_training : bool, default=True
+            是否为训练阶段。训练阶段会保存预处理器状态，测试阶段会复用保存的状态
             
         Returns:
         --------
@@ -283,8 +386,20 @@ class Preprocessing:
             # 1. 缺失值处理 - 优先处理，因为其他步骤可能依赖完整数据
             if 'imputer' in preprocessing_plan and preprocessing_plan['imputer']:
                 try:
-                    X = imp.Imputer(X, strategy=preprocessing_plan['imputer'], verbose=False).transform()
-                    preprocessing_log.append(f"缺失值处理: {preprocessing_plan['imputer']}")
+                    if is_training:
+                        # 训练阶段：创建并保存填充器
+                        imputer = imp.Imputer(X, strategy=preprocessing_plan['imputer'], verbose=False)
+                        X = imputer.transform()  # fit + transform
+                        self.fitted_preprocessors_['imputer'] = imputer
+                        preprocessing_log.append(f"缺失值处理 (训练): {preprocessing_plan['imputer']}")
+                    else:
+                        # 测试阶段：使用保存的填充器
+                        if 'imputer' in self.fitted_preprocessors_:
+                            imputer = self.fitted_preprocessors_['imputer']
+                            X = imputer.transform(new_data=X)  # transform only
+                            preprocessing_log.append(f"缺失值处理 (测试): {preprocessing_plan['imputer']}")
+                        else:
+                            logging.warning("未找到已训练的填充器，跳过缺失值处理")
                 except Exception as e:
                     logging.error(f"缺失值处理失败: {str(e)}")
                     X = X.ffill().bfill()  # 使用新的API替代废弃的fillna(method=)
@@ -314,9 +429,20 @@ class Preprocessing:
                     logging.error(f"重复值检测失败: {str(e)}")
                     preprocessing_log.append("重复值处理: 跳过")
             
-            # 4. 特征编码 - 处理分类变量
+            # 4. 特征编码 - 处理分类变量（全局编码器已在__init__中训练）
             try:
+                # 编码前保存目标变量，避免被one-hot编码破坏
+                target_col_backup = X[target].copy() if target in X.columns else None
                 X = enc.Encoder(dataset=X, ratio_threshold=0.5, count_threshold=50).transform()
+                # 编码后恢复目标变量（如果被one-hot编码了）
+                if target_col_backup is not None and target not in X.columns:
+                    # 删除编码器创建的target相关列（如class_0, class_1等）
+                    target_encoded_cols = [c for c in X.columns if c.startswith(target + '_')]
+                    if target_encoded_cols:
+                        X = X.drop(columns=target_encoded_cols)
+                        logging.info(f"移除编码器对目标变量的one-hot编码列: {target_encoded_cols}")
+                    X[target] = target_col_backup
+                    logging.info(f"已恢复目标变量 '{target}'")
                 preprocessing_log.append("特征编码: 自动编码")
             except Exception as e:
                 logging.error(f"特征编码失败: {str(e)}")
@@ -325,8 +451,20 @@ class Preprocessing:
             # 5. 数据标准化/归一化
             if 'normalizer' in preprocessing_plan and preprocessing_plan['normalizer']:
                 try:
-                    X = nl.Normalizer(X, strategy=preprocessing_plan['normalizer'], verbose=False).transform()
-                    preprocessing_log.append(f"数据标准化: {preprocessing_plan['normalizer']}")
+                    if is_training:
+                        # 训练阶段：创建并保存标准化器（排除目标变量）
+                        normalizer = nl.Normalizer(X, strategy=preprocessing_plan['normalizer'], verbose=False, exclude=[target])
+                        X = normalizer.transform()  # fit + transform
+                        self.fitted_preprocessors_['normalizer'] = normalizer
+                        preprocessing_log.append(f"数据标准化 (训练): {preprocessing_plan['normalizer']}")
+                    else:
+                        # 测试阶段：使用保存的标准化器
+                        if 'normalizer' in self.fitted_preprocessors_:
+                            normalizer = self.fitted_preprocessors_['normalizer']
+                            X = normalizer.transform(new_data=X)  # transform only
+                            preprocessing_log.append(f"数据标准化 (测试): {preprocessing_plan['normalizer']}")
+                        else:
+                            logging.warning("未找到已训练的标准化器，跳过标准化")
                 except Exception as e:
                     logging.error(f"数据标准化失败: {str(e)}")
                     preprocessing_log.append("数据标准化: 跳过")
@@ -334,18 +472,30 @@ class Preprocessing:
             # 6. 特征选择 - 最后执行，因为需要目标变量
             if 'feature_selector' in preprocessing_plan and preprocessing_plan['feature_selector']:
                 try:
-                    original_features = len(X.columns)
-                    X = fs.Feature_selector(
-                        X, 
-                        target=target, 
-                        strategy=preprocessing_plan['feature_selector'], 
-                        threshold=0.1, 
-                        exclude=target,
-                        verbose=False
-                    ).transform()
-                    selected_features = len(X.columns)
-                    removed_features = original_features - selected_features
-                    preprocessing_log.append(f"特征选择: {preprocessing_plan['feature_selector']} (移除{removed_features}个特征)")
+                    if is_training:
+                        # 训练阶段：创建并保存特征选择器
+                        original_features = len(X.columns)
+                        selector = fs.Feature_selector(
+                            X, 
+                            target=target, 
+                            strategy=preprocessing_plan['feature_selector'], 
+                            threshold=0.1, 
+                            exclude=target,
+                            verbose=False
+                        )
+                        X = selector.transform()  # fit + transform
+                        self.fitted_preprocessors_['feature_selector'] = selector
+                        selected_features = len(X.columns)
+                        removed_features = original_features - selected_features
+                        preprocessing_log.append(f"特征选择 (训练): {preprocessing_plan['feature_selector']} (移除{removed_features}个特征)")
+                    else:
+                        # 测试阶段：使用保存的特征选择器
+                        if 'feature_selector' in self.fitted_preprocessors_:
+                            selector = self.fitted_preprocessors_['feature_selector']
+                            X = selector.transform(new_data=X)  # transform only
+                            preprocessing_log.append(f"特征选择 (测试): 使用已保存的特征列表")
+                        else:
+                            logging.warning("未找到已训练的特征选择器，跳过特征选择")
                 except Exception as e:
                     logging.error(f"特征选择失败: {str(e)}")
                     preprocessing_log.append("特征选择: 跳过")
@@ -844,7 +994,11 @@ class NSGA2_Preprocessing:
     
     def _tournament_select(self, population, fronts, distances, tournament_size=2):
         """锦标赛选择"""
-        candidates = random.sample(range(len(population)), tournament_size)
+        # 确保不超过population大小
+        actual_size = min(tournament_size, len(population))
+        if actual_size < 2:
+            actual_size = min(2, len(population))
+        candidates = random.sample(range(len(population)), actual_size)
         
         # 找到每个候选者所在的前沿
         candidate_fronts = []

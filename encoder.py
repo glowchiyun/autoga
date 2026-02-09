@@ -17,6 +17,13 @@ class GlobalEncoderManager:
         self.is_trained = False
         self.ratio_threshold = 0.5
         self.count_threshold = 50
+    
+    def reset(self):
+        """重置编码器状态，用于新的fold或数据集"""
+        self.encoders = {}
+        self.encoding_info = {}
+        self.skipped_features = {}
+        self.is_trained = False
         
     def train_on_data(self, dataset, ratio_threshold=0.5, count_threshold=50):
         """在数据集上训练编码器"""
@@ -59,9 +66,11 @@ class GlobalEncoderManager:
             }
             
             # 训练编码器
-            if strategy == 'LE':
+            if strategy in ('LE', 'LE_FALLBACK'):
                 self.encoders[col] = LabelEncoder()
                 self.encoders[col].fit(X[col].astype(str))
+                if strategy == 'LE_FALLBACK':
+                    print(f"特征 {col} 唯一值较多({X[col].nunique()}个)，使用 LabelEncoder 作为 fallback")
             else:  # Binary Encoding
                 self.encoders[col] = BinaryEncoder(cols=[col])
                 self.encoders[col].fit(X[[col]])
@@ -86,25 +95,27 @@ class GlobalEncoderManager:
             self.skipped_features[col] = "数值型特征"
             return False
             
-        # 检查唯一值比例
-        if ratio >= self.ratio_threshold:
-            self.skipped_features[col] = f"唯一值比例过高 ({ratio:.2%} >= {self.ratio_threshold:.2%})"
-            return False
-            
-        # 检查唯一值数量
-        if n_unique >= self.count_threshold:
-            self.skipped_features[col] = f"唯一值数量过多 ({n_unique} >= {self.count_threshold})"
-            return False
+        # 对于唯一值比例过高或数量过多的特征，使用 LabelEncoder 作为 fallback
+        # 而不是完全跳过（否则这些 object 类型的列会被后续过滤掉）
+        if ratio >= self.ratio_threshold or n_unique >= self.count_threshold:
+            # 标记为需要 fallback 编码，而不是完全跳过
+            return 'fallback'
         
         return True
         
     def _get_encoding_strategy(self, X, col):
         """根据特征的唯一值数量确定编码策略"""
-        if not self._check_thresholds(X, col):
+        check_result = self._check_thresholds(X, col)
+        
+        if check_result == False:
             return None, 0
-            
+        
         n_unique = X[col].nunique()
         
+        # 如果是 fallback 情况（唯一值过多），强制使用 LabelEncoder
+        if check_result == 'fallback':
+            return 'LE_FALLBACK', 1
+            
         # 如果是二分类特征，使用Label Encoding
         if n_unique == 2:
             return 'LE', 1
@@ -131,19 +142,17 @@ class GlobalEncoderManager:
                 
             # 如果特征在训练时被编码，则应用相同的编码
             if col in self.encoders:
-                if self.encoding_info[col]['strategy'] == 'LE':
+                if self.encoding_info[col]['strategy'] in ('LE', 'LE_FALLBACK'):
                     # Label Encoding - 处理新类别
                     try:
                         encoded = self.encoders[col].transform(X[col].astype(str))
                         X[col] = encoded
                     except ValueError as e:
-                        # 处理新类别值
-                        print(f"警告: 特征 {col} 包含新类别值，使用默认值填充")
-                        # 将新类别值替换为最常见的类别
-                        most_common = X[col].mode().iloc[0] if not X[col].mode().empty else X[col].iloc[0]
-                        X[col] = X[col].replace(X[col].unique(), most_common)
-                        encoded = self.encoders[col].transform(X[col].astype(str))
-                        X[col] = encoded
+                        # 处理新类别值 - 使用 -1 表示未知类别
+                        known_classes = set(self.encoders[col].classes_)
+                        X[col] = X[col].astype(str).apply(
+                            lambda x: self.encoders[col].transform([x])[0] if x in known_classes else -1
+                        )
                 else:
                     # Binary Encoding - 处理新类别
                     try:
@@ -310,13 +319,13 @@ class Encoder:
             
         # 检查唯一值比例
         if ratio >= self.ratio_threshold:
-            self.skipped_features[col] = f"唯一值比例过高 ({ratio:.2%} >= {self.ratio_threshold:.2%})"
-            return False
+            # 对于高基数分类特征，使用 fallback 策略（LabelEncoder）
+            return 'fallback'
             
         # 检查唯一值数量
         if n_unique >= self.count_threshold:
-            self.skipped_features[col] = f"唯一值数量过多 ({n_unique} >= {self.count_threshold})"
-            return False
+            # 对于高基数分类特征，使用 fallback 策略（LabelEncoder）
+            return 'fallback'
         
         return True
         
@@ -324,8 +333,17 @@ class Encoder:
         """
         根据特征的唯一值数量确定编码策略
         """
-        if not self._check_thresholds(X, col):
+        check_result = self._check_thresholds(X, col)
+        
+        # 如果被跳过，返回 None
+        if check_result == False:
             return None, 0
+        
+        # 如果是 fallback，使用 LabelEncoder
+        if check_result == 'fallback':
+            n_unique = X[col].nunique()
+            print(f"特征 {col} 唯一值较多({n_unique}个)，使用 LabelEncoder 作为 fallback")
+            return 'LE_FALLBACK', 1
             
         n_unique = X[col].nunique()
         
@@ -355,7 +373,7 @@ class Encoder:
             }
             
             # 执行编码
-            if strategy == 'LE':
+            if strategy in ('LE', 'LE_FALLBACK'):
                 self.encoders[col] = LabelEncoder()
                 encoded = self.encoders[col].fit_transform(X[col].astype(str))
                 return encoded
@@ -451,19 +469,17 @@ class Encoder:
                 
             # 如果特征在训练时被编码，则应用相同的编码
             if col in self.encoders:
-                if self.encoding_info[col]['strategy'] == 'LE':
+                if self.encoding_info[col]['strategy'] in ('LE', 'LE_FALLBACK'):
                     # Label Encoding - 处理新类别
                     try:
                         encoded = self.encoders[col].transform(X[col].astype(str))
                         X[col] = encoded
                     except ValueError as e:
-                        # 处理新类别值
-                        print(f"警告: 特征 {col} 包含新类别值，使用默认值填充")
-                        # 将新类别值替换为最常见的类别
-                        most_common = X[col].mode().iloc[0] if not X[col].mode().empty else X[col].iloc[0]
-                        X[col] = X[col].replace(X[col].unique(), most_common)
-                        encoded = self.encoders[col].transform(X[col].astype(str))
-                        X[col] = encoded
+                        # 处理新类别值 - 使用 -1 表示未知类别
+                        known_classes = set(self.encoders[col].classes_)
+                        X[col] = X[col].astype(str).apply(
+                            lambda x: self.encoders[col].transform([x])[0] if x in known_classes else -1
+                        )
                 else:
                     # Binary Encoding - 处理新类别
                     try:

@@ -15,6 +15,7 @@ import pandas as pd
 import preprocessing as pre
 from range_adjuster import IntelligentRangeAdjuster
 from fitness_predictor import FitnessPredictor
+import yaml
 
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
@@ -67,7 +68,7 @@ except ImportError:
 
 
 class GeneticAlgorithm:
-    def __init__(self, data, target, use_prediction=True, cv_scoring=None, enable_ensemble=False, enable_adaptive_range=True):
+    def __init__(self, data, target, use_prediction=True, cv_scoring=None, enable_ensemble=False, enable_adaptive_range=True, task_type=None):
         """
         初始化遗传算法
         :param data: 输入数据
@@ -76,6 +77,10 @@ class GeneticAlgorithm:
         :param cv_scoring: 交叉验证评分方法
         :param enable_ensemble: 是否启用集成
         :param enable_adaptive_range: 是否启用自适应超参数范围调整
+        :param task_type: 任务类型 (可选，如果不传则自动检测)
+                         'binary' -> 'binary_classification'
+                         'multiclass' -> 'multiclass_classification'
+                         'regression' -> 'regression'
         """
         self.data = data
         self.target = target
@@ -87,21 +92,38 @@ class GeneticAlgorithm:
         self.best_model_features = None  # 保存最佳模型的特征列
         self.prediction_threshold = 0.8  # 预测适应度阈值
         
-        # 检测任务类型
-        self.task_type, target_encoder = self.detect_task_type(data, target)
-        logging.info(f"检测到任务类型: {self.task_type}")  
+        # 检测或使用指定的任务类型
+        if task_type is not None:
+            # 映射AMLB任务类型到GAML任务类型
+            task_type_map = {
+                'binary': 'binary_classification',
+                'multiclass': 'multiclass_classification',
+                'regression': 'regression'
+            }
+            self.task_type = task_type_map.get(task_type, task_type)
+            # 对于分类任务，仍需检查是否需要编码器
+            _, target_encoder = self.detect_task_type(data, target)
+            logging.info(f"使用指定任务类型: {self.task_type} (原始: {task_type})")
+        else:
+            self.task_type, target_encoder = self.detect_task_type(data, target)
+            logging.info(f"自动检测任务类型: {self.task_type}")  
         self.model_hyperparameters = self._get_default_model_hyperparameters()
         
-        # 设置交叉验证评分方法
+        # 设置交叉验证评分方法 - 改进：使用更好的评分指标
         if cv_scoring is None:
-            self.cv_scoring = 'neg_mean_squared_error' if self.task_type == 'regression' else 'accuracy'
+            if self.task_type == 'regression':
+                self.cv_scoring = 'neg_mean_squared_error'
+            elif self.task_type == 'binary_classification':
+                self.cv_scoring = 'roc_auc'  # 二分类使用AUC更合适
+            else:  # multiclass_classification
+                self.cv_scoring = 'accuracy'  # 多分类保持accuracy
         else:
             self.cv_scoring = cv_scoring
         self.target_encoder = target_encoder
         
         # 初始化其他属性
         self.best_score = -np.inf
-        self.fitness_predictor = FitnessPredictor()
+        self.fitness_predictor = FitnessPredictor(model_hyperparameters=self.model_hyperparameters)
         self.range_adjuster = IntelligentRangeAdjuster() if enable_adaptive_range else None  # 新增
 
     def detect_task_type(self, data, target):
@@ -162,65 +184,59 @@ class GeneticAlgorithm:
             return 'regression', None   
         
     def _get_default_model_hyperparameters(self):
-        if self.task_type == 'regression':
-            return {
-                'LASSO': {'alpha': [0.0001, 0.001, 0.01, 0.1]},
-                'OLS': {},
-                'Ridge': {'alpha': [0.001, 0.01, 0.1, 1.0, 10.0]},
-                'ElasticNet': {'alpha': [0.001, 0.01, 0.1, 1.0, 10.0], 'l1_ratio': [0.1, 0.5, 0.7, 0.9]},
-                'SVR': {'C': [0.1, 1.0, 10.0], 'gamma': ['scale', 'auto', 0.1, 0.01]},
-                'RandomForest': {'n_estimators': [50, 100, 200], 'max_depth': [None, 10, 20, 30]},
-                'GradientBoosting': {'n_estimators': [100, 200], 'learning_rate': [0.1, 0.05], 'max_depth': [3, 4]}
-            }
-        elif self.task_type == 'binary_classification':
-            return {
-                'LogisticRegression': {'C': [0.1, 1.0, 10.0], 'solver': ['liblinear', 'lbfgs'], 'max_iter': [100, 200, 300, 400]},
-                #'SVM': {'C': [0.1, 1.0, 10.0], 'kernel': ['linear', 'rbf']},
-                'RandomForest': {'n_estimators': [50, 100, 200], 'max_depth': [None, 10, 20]},
-                'GradientBoosting': {'n_estimators': [100, 200], 'learning_rate': [0.1, 0.05], 'max_depth': [3, 4]},
-                'XGBoost': {
-                    'n_estimators': [50, 100, 200],
-                    'max_depth': [3, 5, 7],
-                    'learning_rate': [0.01, 0.1, 0.2],
-                    'subsample': [0.6, 0.8, 1.0],
-                    'colsample_bytree': [0.6, 0.8, 1.0]
-                },
-                'LightGBM': {
-                    'n_estimators': [50, 100, 200],
-                    'max_depth': [3, 5, 7],
-                    'learning_rate': [0.01, 0.1, 0.2],
-                    'num_leaves': [31, 63, 127],
-                    'subsample': [0.6, 0.8, 1.0]
-                }
-            }
-        else:  # multiclass_classification
-            return {
-                'LogisticRegression': {'C': [0.1, 1.0, 10.0], 'solver': ['lbfgs', 'newton-cg'], 'max_iter': [100, 200, 300, 400]},
-                #'SVM': {'C': [0.1, 1.0, 10.0], 'kernel': ['linear', 'rbf']},
-                'RandomForest': {'n_estimators': [50, 100, 200], 'max_depth': [None, 10, 20]},
-                'GradientBoosting': {'n_estimators': [100, 200], 'learning_rate': [0.1, 0.05], 'max_depth': [3, 4]},
-                'XGBoost': {
-                    'n_estimators': [50, 100, 200],
-                    'max_depth': [3, 5, 7],
-                    'learning_rate': [0.01, 0.1, 0.2],
-                    'subsample': [0.6, 0.8, 1.0],
-                    'colsample_bytree': [0.6, 0.8, 1.0]
-                },
-                'LightGBM': {
-                    'n_estimators': [50, 100, 200],
-                    'max_depth': [3, 5, 7],
-                    'learning_rate': [0.01, 0.1, 0.2],
-                    'num_leaves': [31, 63, 127],
-                    'subsample': [0.6, 0.8, 1.0]
-                },
-                'CatBoost': {
-                    'iterations': [50, 100, 200],
-                    'depth': [3, 5, 7],
-                    'learning_rate': [0.01, 0.1, 0.2],
-                    'l2_leaf_reg': [1, 3, 5],
-                    'bootstrap_type': ['Bernoulli', 'Bayesian']
-                }
-            }
+        """
+        从配置文件加载模型超参数
+        """
+        config_path = os.path.join(os.path.dirname(__file__), 'model_hyperparameters.yaml')
+        
+        # 尝试从 YAML 文件加载
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = yaml.safe_load(f)
+                
+                # 将 YAML 中的 null 转换为 None，列表转换为元组（用于 hidden_layer_sizes）
+                def convert_values(params):
+                    converted = {}
+                    for key, values in params.items():
+                        if isinstance(values, list):
+                            converted_list = []
+                            for v in values:
+                                if v is None:
+                                    converted_list.append(None)
+                                elif isinstance(v, list):
+                                    converted_list.append(tuple(v))  # 转换嵌套列表为元组
+                                else:
+                                    converted_list.append(v)
+                            converted[key] = converted_list
+                        else:
+                            converted[key] = values
+                    return converted
+                
+                # 根据任务类型返回配置
+                if self.task_type == 'regression':
+                    params = config.get('regression', {})
+                elif self.task_type == 'binary_classification':
+                    params = config.get('binary_classification', {})
+                else:  # multiclass_classification
+                    params = config.get('multiclass_classification', {})
+                
+                # 转换所有模型的参数
+                result = {}
+                for model_name, model_params in params.items():
+                    result[model_name] = convert_values(model_params)
+                
+                logging.info(f"从配置文件加载超参数: {config_path}")
+                return result
+                
+            except Exception as e:
+                error_msg = f"加载配置文件失败: {e}"
+                logging.error(error_msg)
+                raise RuntimeError(error_msg)
+        else:
+            error_msg = f"配置文件不存在: {config_path}，请确保 model_hyperparameters.yaml 文件存在"
+            logging.error(error_msg)
+            raise FileNotFoundError(error_msg)
 
     def initialize_population(self, population_size):
         models = list(self.model_hyperparameters.keys())
@@ -361,7 +377,7 @@ class GeneticAlgorithm:
             config = self.decode_chromosome(chromosome)
             processed_data = data.copy()
             if self.task_type == 'regression':
-                score, model = rg.Regressor(
+                score, model, actual_features = rg.Regressor(
                     dataset=processed_data,
                     target=target,
                     strategy=config['model'],
@@ -370,13 +386,12 @@ class GeneticAlgorithm:
                 ).transform()
 
                 if self.enable_ensemble and model is not None and score > -np.inf:
-                    # 保存训练时使用的特征列（去除目标变量）
-                    train_features = [col for col in processed_data.columns if col != target]
-                    self.add_top_models(chromosome, score, model, processed_features=train_features)
+                    # 使用模型实际使用的特征列（由Regressor返回）
+                    self.add_top_models(chromosome, score, model, processed_features=actual_features)
 
                 return score, model
             else:  # classification tasks
-                score, model = cl.Classifier(
+                score, model, actual_features = cl.Classifier(
                     dataset=processed_data,
                     target=target,
                     strategy=config['model'],
@@ -385,49 +400,45 @@ class GeneticAlgorithm:
                 ).transform()
 
                 if self.enable_ensemble and model is not None and score > -np.inf:
-                    # 保存训练时使用的特征列（去除目标变量）
-                    train_features = [col for col in processed_data.columns if col != target]
-                    self.add_top_models(chromosome, score, model, processed_features=train_features)
+                    # 使用模型实际使用的特征列（由Classifier返回）
+                    self.add_top_models(chromosome, score, model, processed_features=actual_features)
                 return score, model
         except Exception as e:
             logging.error(f"Fitness calculation error: {str(e)}")
             return -np.inf, None
 
     def evaluate_individual(self, chromo, data, target):
-        """评估单个个体的适应度 - 改进的预测策略"""
+        """评估单个个体的适应度 - 改进的预测策略（使用置信度调节）"""
         try:
-            # 改进的预测策略：使用概率采样而非严格阈值
+            # 改进的预测策略：结合不确定性估计决定是否跳过评估
             should_evaluate = True
             
             if self.use_prediction and self.fitness_predictor.is_trained:
-                predicted_fitness = self.fitness_predictor.predict(chromo)
-                if predicted_fitness is not None:
-                    # 改进：使用归一化的差距，避免负分数时的异常行为
-                    if self.best_score > -np.inf and len(self.fitness_predictor.history['fitnesses']) > 1:
-                        # 获取历史分数并过滤-inf
-                        valid_scores = [s for s in self.fitness_predictor.history['fitnesses'] if s != -np.inf]
-                        if len(valid_scores) > 1:
-                            # 计算分数范围用于归一化
-                            score_range = max(valid_scores) - min(valid_scores)
-                            if score_range > 1e-10:
-                                # 归一化差距到[0, 1]
-                                normalized_gap = (self.best_score - predicted_fitness) / score_range
-                                # 转换为评估概率：差距越大，评估概率越低
-                                eval_probability = 1.0 - np.clip(normalized_gap, 0, 0.9)
-                                eval_probability = np.clip(eval_probability, 0.1, 1.0)
-                            else:
-                                # 分数范围太小，全部评估
-                                eval_probability = 1.0
-                        else:
-                            eval_probability = 1.0
-                    else:
-                        eval_probability = 1.0  # 初期全部评估
+                confidence = self.fitness_predictor.get_confidence()
+                
+                if confidence > 0.3:  # 降低门槛到0.3（使代理模型更早发挥作用）
+                    # 使用不确定性估计（RF树方差）进行更智能的跳过决策
+                    predicted_fitness, uncertainty = self.fitness_predictor.predict_with_uncertainty(chromo)
                     
-                    should_evaluate = random.random() < eval_probability
-                    
-                    if not should_evaluate:
-                        # 使用预测值（但标记为预测，不添加到历史）
-                        return (predicted_fitness, chromo, None)
+                    if predicted_fitness is not None and self.best_score > -np.inf:
+                        # 计算相对差距
+                        relative_gap = (self.best_score - predicted_fitness) / max(abs(self.best_score), 0.01)
+                        
+                        # 策略：预测分数远低于最佳分数，且不确定性低时，跳过评估
+                        # 不确定性高意味着模型"不确定"，应该评估以获取信息
+                        uncertainty_ratio = uncertainty / max(abs(predicted_fitness), 0.01) if uncertainty is not None else 1.0
+                        
+                        if relative_gap > 0.05 and uncertainty_ratio < 0.3:
+                            # 跳过概率随差距增大和置信度增加而增大
+                            base_skip = min(0.6, relative_gap * 4)
+                            skip_probability = base_skip * min(confidence, 1.0)
+                            should_evaluate = random.random() > skip_probability
+                            
+                            if not should_evaluate:
+                                logging.debug(f"跳过评估: 预测={predicted_fitness:.4f}, 最佳={self.best_score:.4f}, "
+                                            f"差距={relative_gap:.2%}, 不确定性={uncertainty:.4f}, 置信度={confidence:.2f}")
+                                return (predicted_fitness, chromo, None)
+                    # 如果预测分数接近或高于最佳分数，或不确定性高，仍然全部评估
             
             # 评估实际适应度
             actual_fitness, model = self.fitness_function(chromo, data.copy(), target)
@@ -439,14 +450,16 @@ class GeneticAlgorithm:
             
             self.fitness_predictor.add_history(chromo, actual_fitness)
             
-            # 定期重新训练预测模型（改为每100个样本）
-            if self.use_prediction:
-                if len(self.fitness_predictor.history['chromosomes']) >= 50 and \
-                   len(self.fitness_predictor.history['chromosomes']) % 100 == 0:
-                    logging.info(f"重新训练预测模型... (已收集{len(self.fitness_predictor.history['chromosomes'])}个样本)")
-                    self.fitness_predictor.train()
-                    if self.fitness_predictor.is_trained:
-                        logging.info("预测模型训练完成")
+            # 智能重训练：使用 FitnessPredictor 自身的判断
+            if self.use_prediction and self.fitness_predictor.should_retrain():
+                n_samples = len(self.fitness_predictor.history['chromosomes'])
+                logging.info(f"重新训练预测模型... (已收集{n_samples}个样本)")
+                success = self.fitness_predictor.train()
+                if success:
+                    confidence = self.fitness_predictor.get_confidence()
+                    logging.info(f"✓ 预测模型训练完成 (R²={confidence:.4f})")
+                else:
+                    logging.warning("✗ 预测模型训练失败")
             
             # 记录超参数用于自适应范围调整
             if self.enable_adaptive_range and self.range_adjuster is not None:
@@ -478,6 +491,11 @@ class GeneticAlgorithm:
             logging.debug(f"第{generation}代：不满足调整间隔条件，跳过调整")
             return
         
+        # 检查是否已达到最大调整次数
+        if self.range_adjuster.adjustment_count >= self.range_adjuster.max_adjustments:
+            logging.info(f"第{generation}代：已达到最大调整次数({self.range_adjuster.max_adjustments})，停止调整以保持搜索多样性")
+            return
+        
         logging.info(f"\n{'='*50}")
         logging.info(f"第{generation}代：开始自动调整超参数范围")
         logging.info(f"{'='*50}")
@@ -506,22 +524,77 @@ class GeneticAlgorithm:
             logging.info(f"✓ 累计调整次数：{self.range_adjuster.adjustment_count + 1}")
             logging.info(f"{'='*50}\n")
             self.range_adjuster.adjustment_count += 1
+            
+            # 同步更新适应度预测器的模型超参数信息（范围变化后特征工程需要更新）
+            if self.use_prediction and hasattr(self.fitness_predictor, 'update_model_hyperparameters'):
+                self.fitness_predictor.update_model_hyperparameters(self.model_hyperparameters)
+                logging.info("✓ 已同步更新适应度预测器的超参数范围信息")
         else:
             logging.info(f"本次检查：所有超参数范围均未发生变化")
             logging.info(f"{'='*50}\n")
     
     def run(self, generations=20, population_size=50, mutation_rate=0.2, 
-            elite_size=2, n_jobs=-1, time_limit=None, tournament_size=3):
+            elite_size=2, n_jobs=-1, time_limit=None, tournament_size=3,
+            early_stop_patience=8, min_improvement=1e-6, adaptive_mutation=True,
+            mode='generations'):
         """
-        运行遗传算法
-        :param generations: 迭代次数
+        运行遗传算法 - 支持两种运行模式
+        
+        :param generations: 迭代次数（mode='generations'时有效）
         :param population_size: 种群大小
         :param mutation_rate: 变异率
         :param elite_size: 精英个体数量
         :param n_jobs: 并行数
-        :param time_limit: 时间限制（秒），如果为None则不限制时间
+        :param time_limit: 时间限制（秒），mode='time_budget'时必须指定
         :param tournament_size: 锦标赛规模
-        :return: (best_config, best_score, history, avg_history, best_model, ensemble_model)
+        :param early_stop_patience: 早停耐心值，连续多少代无改进则停止（仅mode='generations'时有效）
+        :param min_improvement: 最小改进阈值，低于此值视为无改进
+        :param adaptive_mutation: 是否启用自适应变异率
+        :param mode: 运行模式
+                    - 'generations': 基于代数，进化到指定代数停止（默认）
+                    - 'time_budget': 基于时间预算，不断优化直到时间耗尽
+        :return: (best_config, best_score, history, avg_history, best_model)
+        """
+        # 参数验证
+        if mode == 'time_budget' and time_limit is None:
+            raise ValueError("time_budget 模式必须指定 time_limit 参数")
+        
+        if mode == 'time_budget':
+            logging.info(f"=== 启动时间预算模式 ===")
+            logging.info(f"时间限制: {time_limit}秒 ({time_limit/60:.1f}分钟)")
+            logging.info(f"策略: 持续优化直到时间耗尽，充分利用计算资源")
+            return self._run_time_budget_mode(
+                population_size=population_size,
+                mutation_rate=mutation_rate,
+                elite_size=elite_size,
+                n_jobs=n_jobs,
+                time_limit=time_limit,
+                tournament_size=tournament_size,
+                min_improvement=min_improvement,
+                adaptive_mutation=adaptive_mutation
+            )
+        else:
+            logging.info(f"=== 启动代数模式 ===")
+            logging.info(f"进化代数: {generations}")
+            logging.info(f"早停策略: patience={early_stop_patience}, min_improvement={min_improvement}")
+            return self._run_generations_mode(
+                generations=generations,
+                population_size=population_size,
+                mutation_rate=mutation_rate,
+                elite_size=elite_size,
+                n_jobs=n_jobs,
+                time_limit=time_limit,
+                tournament_size=tournament_size,
+                early_stop_patience=early_stop_patience,
+                min_improvement=min_improvement,
+                adaptive_mutation=adaptive_mutation
+            )
+    
+    def _run_generations_mode(self, generations, population_size, mutation_rate, 
+                             elite_size, n_jobs, time_limit, tournament_size,
+                             early_stop_patience, min_improvement, adaptive_mutation):
+        """
+        基于代数的运行模式（原有逻辑）
         """
         data=self.data
         target=self.target
@@ -532,12 +605,22 @@ class GeneticAlgorithm:
         history = []
         avg_history = []
         
+        # 早停相关变量
+        no_improvement_count = 0
+        previous_best = -np.inf
+        current_mutation_rate = mutation_rate
+        
         start_time = time.time()
         
         for gen in range(generations):
             # 检查时间限制
             if time_limit is not None and time.time() - start_time > time_limit:
                 logging.info(f"达到时间限制 {time_limit} 秒，提前结束进化")
+                break
+            
+            # 早停检查
+            if early_stop_patience is not None and no_improvement_count >= early_stop_patience:
+                logging.info(f"连续 {early_stop_patience} 代无改进，触发早停机制")
                 break
                 
             # 并行评估种群适应度
@@ -570,6 +653,24 @@ class GeneticAlgorithm:
             avg_fitness = np.mean(scores) if scores else -np.inf
             
             avg_history.append(avg_fitness)
+            
+            # 早停检测：检查是否有显著改进
+            improvement = best_score - previous_best
+            if improvement > min_improvement:
+                no_improvement_count = 0
+                previous_best = best_score
+            else:
+                no_improvement_count += 1
+            
+            # 自适应变异率：无改进时增加变异率以跳出局部最优
+            if adaptive_mutation:
+                if no_improvement_count >= 3:
+                    # 逐步增加变异率，但不超过0.5
+                    current_mutation_rate = min(0.5, mutation_rate * (1 + 0.15 * no_improvement_count))
+                    if no_improvement_count == 3:
+                        logging.info(f"启用自适应变异率: {current_mutation_rate:.3f}")
+                else:
+                    current_mutation_rate = mutation_rate
             
             # 选择精英个体
             elite = sorted(zip(scores, valid_pop), key=lambda x: x[0], reverse=True)[:elite_size]
@@ -617,20 +718,23 @@ class GeneticAlgorithm:
                             if param_values:
                                 p2[i] = random.randint(0, len(param_values) - 1)
                     c1, c2 = self.crossover(p1, p2)
-                    next_gen.append(self.mutate(c1, mutation_rate))
-                    next_gen.append(self.mutate(c2, mutation_rate))
+                    next_gen.append(self.mutate(c1, current_mutation_rate))
+                    next_gen.append(self.mutate(c2, current_mutation_rate))
             else:
                 while len(next_gen) < population_size - elite_size:
                     # 随机选一个有两个及以上个体的模型
                     model_idx = random.choice(candidate_model_indices)
                     idxs = model_to_indices[model_idx]
                     # 随机选两个不同的个体
+                    # 确保有足够的索引
+                    if len(idxs) < 2:
+                        continue
                     p1_idx, p2_idx = random.sample(idxs, 2)
                     p1 = selected_population[p1_idx]
                     p2 = selected_population[p2_idx]
                     c1, c2 = self.crossover(p1, p2)
-                    next_gen.append(self.mutate(c1, mutation_rate))
-                    next_gen.append(self.mutate(c2, mutation_rate))
+                    next_gen.append(self.mutate(c1, current_mutation_rate))
+                    next_gen.append(self.mutate(c2, current_mutation_rate))
             
             population = next_gen[:population_size - elite_size] + elite
             
@@ -638,15 +742,210 @@ class GeneticAlgorithm:
             history.append(best_score)
                 
             elapsed_time = time.time() - start_time
+            # 统计实际评估的个体数量（model不为None表示实际评估）
+            actual_evaluated = sum(1 for _, _, model in valid_results if model is not None)
+            predicted_count = len(valid_results) - actual_evaluated
             valid_count = len(valid_pop)
             # 只输出关键代际信息
             if (gen + 1) % 5 == 0 or gen == 0 or gen == generations - 1:
-                logging.info(f"Gen {gen+1}/{generations} | Best: {history[-1]:.4f} | Avg: {avg_fitness:.4f} | Valid: {valid_count}/{population_size} | Time: {elapsed_time:.2f}s")
+                stagnation_info = f" | Stagnation: {no_improvement_count}" if no_improvement_count > 0 else ""
+                mutation_info = f" | MutRate: {current_mutation_rate:.3f}" if current_mutation_rate != mutation_rate else ""
+                if predicted_count > 0:
+                    logging.info(f"Gen {gen+1}/{generations} | Best: {history[-1]:.4f} | Avg: {avg_fitness:.4f} | Eval: {actual_evaluated}/{population_size} (预测跳过: {predicted_count}){stagnation_info}{mutation_info} | Time: {elapsed_time:.2f}s")
+                else:
+                    logging.info(f"Gen {gen+1}/{generations} | Best: {history[-1]:.4f} | Avg: {avg_fitness:.4f} | Valid: {valid_count}/{population_size}{stagnation_info}{mutation_info} | Time: {elapsed_time:.2f}s")
             else:
                 logging.debug(f"Gen {gen+1}/{generations} | Best: {history[-1]:.4f} | Avg: {avg_fitness:.4f}")
 
         
         return best_config, best_score, history, avg_history, best_model
+    
+    def _run_time_budget_mode(self, population_size, mutation_rate, elite_size, 
+                             n_jobs, time_limit, tournament_size, min_improvement, 
+                             adaptive_mutation):
+        """
+        基于时间预算的运行模式 - 持续优化直到时间耗尽
+        
+        策略：
+        1. 设置时间缓冲（预留5%时间用于最后的集成预测和收尾）
+        2. 持续进化，每代结束后检查时间
+        3. 时间耗尽时立即停止，返回当前最优模型
+        4. 保持全局最优模型和top_models列表
+        """
+        data = self.data
+        target = self.target
+        
+        # 时间管理
+        start_time = time.time()
+        time_buffer = time_limit * 0.05  # 预留5%时间缓冲
+        effective_time_limit = time_limit - time_buffer
+        
+        # 全局最优跟踪
+        global_best_config = None
+        global_best_score = -np.inf
+        global_best_model = None
+        global_history = []
+        global_avg_history = []
+        
+        # 初始化种群（只需一次）
+        population = self.initialize_population(population_size)
+        
+        # 进化参数
+        generation = 0
+        current_mutation_rate = mutation_rate
+        no_improvement_count = 0  # 连续无改进代数
+        previous_best = -np.inf
+        
+        logging.info(f"时间预算模式启动:")
+        logging.info(f"  总时间预算: {time_limit}秒")
+        logging.info(f"  有效优化时间: {effective_time_limit}秒")
+        logging.info(f"  时间缓冲: {time_buffer}秒")
+        
+        while True:
+            # 检查时间是否耗尽
+            elapsed = time.time() - start_time
+            remaining = effective_time_limit - elapsed
+            
+            if remaining <= 0:
+                logging.info(f"\n{'='*60}")
+                logging.info(f"时间预算耗尽，停止优化")
+                logging.info(f"总耗时: {elapsed:.1f}秒 / {time_limit}秒")
+                logging.info(f"完成代数: {generation}")
+                logging.info(f"{'='*60}")
+                break
+            
+            generation += 1
+            
+            # 并行评估种群适应度
+            results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(self.evaluate_individual)(chromo, data, target) 
+                for chromo in population
+            )
+            
+            # 过滤失败的个体
+            valid_results = [(score, chromo, model) for score, chromo, model in results 
+                            if score != -np.inf]
+            
+            if not valid_results:
+                logging.warning(f"第{generation}代: 没有有效个体")
+                continue
+            
+            scores = [s for s, _, _ in valid_results]
+            valid_pop = [c for _, c, _ in valid_results]
+            
+            # 更新全局最佳 - 关键修复：只有实际评估过的个体（model不为None）才能更新全局最优
+            # 适应度预测跳过的个体返回 (predicted_fitness, chromo, None)，
+            # 其预测值可能因误差而虚高，不应覆盖真正训练过的最优模型
+            for score, chromo, model in valid_results:
+                if score > global_best_score and model is not None:
+                    global_best_score = score
+                    global_best_config = chromo
+                    global_best_model = model
+                    self.best_score = global_best_score
+                    logging.info(f"  ✓ 新全局最优! 第{generation}代 | Score: {global_best_score:.4f} | 剩余: {remaining:.1f}s")
+            
+            avg_fitness = np.mean(scores)
+            global_history.append(global_best_score)
+            global_avg_history.append(avg_fitness)
+            
+            # 早停检测：检查是否有显著改进
+            improvement = global_best_score - previous_best
+            if improvement > min_improvement:
+                no_improvement_count = 0
+                previous_best = global_best_score
+            else:
+                no_improvement_count += 1
+            
+            # 自适应变异率
+            if adaptive_mutation:
+                if no_improvement_count > 0:
+                    current_mutation_rate = min(mutation_rate * 1.5, 0.5)
+                else:
+                    current_mutation_rate = mutation_rate
+            
+            # 选择精英
+            elite = sorted(zip(scores, valid_pop), key=lambda x: x[0], reverse=True)[:elite_size]
+            elite = [c for (s, c) in elite]
+            
+            # 超参数范围自适应调整
+            if self.enable_adaptive_range and generation % 5 == 0:
+                self.adjust_hyperparameter_ranges(generation)
+            
+            # 锦标赛选择
+            selected_population = self.tournament_selection(valid_pop, scores, tournament_size)
+            
+            # 交叉变异生成子代
+            next_gen = []
+            from collections import defaultdict
+            model_to_indices = defaultdict(list)
+            models = list(self.model_hyperparameters.keys())
+            
+            for idx, chromo in enumerate(selected_population):
+                if len(chromo) > 0:
+                    model_idx = chromo[0]
+                    if model_idx < len(models):
+                        model_to_indices[model_idx].append(idx)
+            
+            candidate_model_indices = [m for m, idxs in model_to_indices.items() if len(idxs) >= 2]
+            
+            if not candidate_model_indices:
+                while len(next_gen) < population_size - elite_size:
+                    idx = random.randint(0, len(selected_population) - 1)
+                    parent1 = selected_population[idx]
+                    if len(parent1) > 0:
+                        model_idx = parent1[0]
+                        if model_idx < len(models):
+                            new_chromo = [model_idx]
+                            model_name = models[model_idx]
+                            hyper_params = self.model_hyperparameters[model_name]
+                            for param_name, values in hyper_params.items():
+                                if len(values) > 0:
+                                    new_chromo.append(random.randint(0, len(values) - 1))
+                                else:
+                                    new_chromo.append(0)
+                            max_hyper = max(len(p) for p in self.model_hyperparameters.values())
+                            remaining_params = max_hyper - len(hyper_params)
+                            new_chromo += [0] * remaining_params
+                            parent2 = new_chromo
+                        else:
+                            parent2 = selected_population[random.randint(0, len(selected_population) - 1)]
+                    else:
+                        parent2 = selected_population[random.randint(0, len(selected_population) - 1)]
+                    
+                    child1, child2 = self.crossover(parent1, parent2)
+                    next_gen.append(self.mutate(child1, current_mutation_rate))
+                    if len(next_gen) < population_size - elite_size:
+                        next_gen.append(self.mutate(child2, current_mutation_rate))
+            else:
+                while len(next_gen) < population_size - elite_size:
+                    chosen_model_idx = random.choice(candidate_model_indices)
+                    candidates = [selected_population[i] for i in model_to_indices[chosen_model_idx]]
+                    parent1, parent2 = random.sample(candidates, 2)
+                    child1, child2 = self.crossover(parent1, parent2)
+                    next_gen.append(self.mutate(child1, current_mutation_rate))
+                    if len(next_gen) < population_size - elite_size:
+                        next_gen.append(self.mutate(child2, current_mutation_rate))
+            
+            population = next_gen[:population_size - elite_size] + elite
+            
+            # 每5代输出一次进度信息
+            if generation % 5 == 0:
+                stagnation_info = f" | 停滞: {no_improvement_count}代" if no_improvement_count > 0 else ""
+                mutation_info = f" | 变异率: {current_mutation_rate:.3f}" if current_mutation_rate != mutation_rate else ""
+                logging.info(f"第{generation}代 | 最优: {global_best_score:.4f} | 平均: {avg_fitness:.4f} | 已用: {elapsed:.1f}s | 剩余: {remaining:.1f}s{stagnation_info}{mutation_info}")
+        
+        # 最终统计
+        total_elapsed = time.time() - start_time
+        logging.info(f"\n{'='*60}")
+        logging.info(f"时间预算模式完成")
+        logging.info(f"{'='*60}")
+        logging.info(f"总耗时: {total_elapsed:.1f}秒 / {time_limit}秒 (利用率: {total_elapsed/time_limit*100:.1f}%)")
+        logging.info(f"完成代数: {generation}")
+        logging.info(f"最终得分: {global_best_score:.4f}")
+        logging.info(f"Top模型数量: {len(self.top_models)}")
+        logging.info(f"{'='*60}\n")
+        
+        return global_best_config, global_best_score, global_history, global_avg_history, global_best_model
 
     def add_top_models(self, chromosome, score, model, processed_features=None):
         """
@@ -656,6 +955,18 @@ class GeneticAlgorithm:
         :param model: 训练好的模型
         :param processed_features: 预处理后的特征列名列表
         """
+        # 回归任务质量门控：拒绝与最佳模型差距过大的模型进入候选池
+        if self.task_type == 'regression' and len(self.top_models) > 0:
+            best_existing_score = self.top_models[0]['score']  # 已按分数降序排列
+            if abs(best_existing_score) > 1e-8:
+                # 对于neg_MSE（负值，越接近0越好），只保留MSE不超过最佳3倍的模型
+                # 例: best=-100, threshold=-300, score=-500 会被拒绝
+                quality_threshold = best_existing_score * 3
+                if score < quality_threshold:
+                    logging.debug(f"回归质量门控: 拒绝低质量模型 (score={score:.4f}, "
+                                  f"best={best_existing_score:.4f}, threshold={quality_threshold:.4f})")
+                    return
+        
         # 解码染色体获取模型类型
         config = self.decode_chromosome(chromosome)
         model_type = config['model']
@@ -686,11 +997,19 @@ class GeneticAlgorithm:
         self.top_models.sort(key=lambda x: x['score'], reverse=True)
         #logging.info(f"模型已添加到集成候选列表，当前候选模型数量: {len(self.top_models)}")
 
-    def integrated_predict(self, X, target=None):
+    def integrated_predict(self, X, target=None, voting='soft'):
         """
-        对self.top_models中的模型进行加权平均集成 - 改进版本
+        对self.top_models中的模型进行集成预测 - 高级版本
+        
+        改进点：
+        1. 分类任务使用概率预测+加权投票（软投票/硬投票）
+        2. 更智能的权重策略（指数权重+平方根平滑）
+        3. 异常预测检测和处理
+        4. 回归任务使用加权中位数（对异常值更鲁棒）
+        
         :param X: 输入数据
         :param target: 目标变量名
+        :param voting: 投票方式，'soft'(软投票，基于概率) 或 'hard'(硬投票，基于类别)
         :return: 集成预测结果
         """
         if len(self.top_models) == 0:
@@ -699,11 +1018,14 @@ class GeneticAlgorithm:
 
         try:
             predictions = []
-            weights = []
+            probabilities = []  # 用于分类任务的概率预测
+            scores = []
+            valid_models = []
 
             for idx, model_info in enumerate(self.top_models):
                 model = model_info['model']
                 model_name = model_info['model_name']
+                model_score = model_info['score']
                 try:
                     X_input = X.copy()
                     if self.target in X_input.columns:
@@ -712,18 +1034,28 @@ class GeneticAlgorithm:
                     # 使用训练时保存的特征列，确保特征一致性
                     if 'feature_columns' in model_info and model_info['feature_columns']:
                         expected_features = model_info['feature_columns']
-                        # 只选择存在且为数值类型的特征
-                        available_features = []
+                        
+                        # 步骤1：删除训练时没有的额外特征
+                        extra_features = [f for f in X_input.columns if f not in expected_features]
+                        if extra_features:
+                            logging.warning(f"模型 {model_name} 测试集有训练时不存在的特征，将删除: {extra_features}")
+                            X_input = X_input.drop(columns=extra_features)
+                        
+                        # 步骤2：添加训练时有但测试集缺失的特征（填充0）
                         for feat in expected_features:
-                            if feat in X_input.columns and pd.api.types.is_numeric_dtype(X_input[feat]):
-                                available_features.append(feat)
+                            if feat not in X_input.columns:
+                                logging.warning(f"模型 {model_name} 缺少特征 '{feat}'，填充为0")
+                                X_input[feat] = 0
+                            elif not pd.api.types.is_numeric_dtype(X_input[feat]):
+                                logging.warning(f"模型 {model_name} 特征 '{feat}' 不是数值类型，转换为数值")
+                                try:
+                                    X_input[feat] = pd.to_numeric(X_input[feat], errors='coerce').fillna(0)
+                                except:
+                                    X_input[feat] = 0
                         
-                        if not available_features:
-                            logging.warning(f"模型 {model_name} 没有可用的数值特征，跳过此模型")
-                            continue
-                        
-                        X_input = X_input[available_features]
-                    
+                        # 步骤3：按训练时的特征顺序选择
+                        X_input = X_input[expected_features]
+                        logging.info(f"模型 {model_name} 使用 {len(expected_features)} 个特征进行预测")
                     else:
                         # fallback：使用数值特征
                         X_input = X_input.select_dtypes(include=[np.number])
@@ -732,14 +1064,34 @@ class GeneticAlgorithm:
                         logging.error(f"模型 {model_name} 没有可用的特征")
                         continue
                     
-                    pred = model.predict(X_input)
+                    # 分类任务：获取概率预测和类别预测
+                    if self.task_type in ['binary_classification', 'multiclass_classification']:
+                        if hasattr(model, 'predict_proba'):
+                            proba = model.predict_proba(X_input)
+                            probabilities.append(proba)
+                            pred = model.predict(X_input)
+                            # Diagnostic: log model.classes_ and sample probabilities for debugging
+                            if idx < 3:  # Only log first 3 models to avoid spam
+                                model_classes = getattr(model, 'classes_', 'N/A')
+                                logging.info(f"[DIAG] Model {idx} ({model_name}): classes_={model_classes}, "
+                                           f"proba shape={proba.shape}, "
+                                           f"proba[0]={proba[0] if len(proba) > 0 else 'empty'}, "
+                                           f"pred[0]={pred[0] if len(pred) > 0 else 'empty'}")
+                        else:
+                            # 模型不支持概率预测，只能使用硬投票
+                            pred = model.predict(X_input)
+                            probabilities.append(None)
+                    else:
+                        # 回归任务
+                        pred = model.predict(X_input)
+                    
+                    # 修复：统一展平预测结果为1维数组（CatBoost返回2维需要ravel）
+                    pred = np.asarray(pred).ravel()
                     predictions.append(pred)
+                    scores.append(model_score)
+                    valid_models.append(model_name)
                     
-                    # 改进的权重策略：使用排名而非原始分数（避免量纲问题）
-                    rank_weight = len(self.top_models) - idx
-                    weights.append(rank_weight)
-                    
-                    logging.info(f"模型 {model_name} 预测完成，排名权重: {rank_weight}")
+                    logging.info(f"模型 {model_name} 预测完成，得分: {model_score:.4f}")
                 except Exception as e:
                     logging.error(f"模型 {model_name} 预测失败: {str(e)}")
                     continue
@@ -755,32 +1107,119 @@ class GeneticAlgorithm:
                 return None
 
             predictions = np.array(predictions)
-            weights = np.array(weights, dtype=float)
-
+            scores = np.array(scores, dtype=float)
+            
+            # 改进的权重策略：指数权重 + 平方根平滑
+            if np.min(scores) == np.max(scores):
+                weights = np.ones(len(scores))
+            else:
+                # 归一化分数到 [0, 1]
+                normalized_scores = (scores - np.min(scores)) / (np.max(scores) - np.min(scores) + 1e-8)
+                # 使用指数权重，但用平方根平滑，避免过度偏向最优模型
+                weights = np.exp(3 * normalized_scores)  # 提高指数系数到3
+                # 平方根平滑，让权重分布更均匀
+                weights = np.sqrt(weights)
+            
             # 归一化权重
             weights = weights / np.sum(weights)
+            
+            logging.info(f"集成权重: {dict(zip(valid_models, weights.round(3)))}")
 
-            # 使用权重平均
-            final_prediction = np.average(predictions, axis=0, weights=weights)
-            final_prediction = np.array(final_prediction).flatten()
-
-            # 分类任务的后处理
+            # 根据任务类型选择集成策略
             if self.task_type in ['binary_classification', 'multiclass_classification']:
-                final_prediction = np.round(final_prediction).astype(int)
+                # 分类任务：使用投票机制
+                if voting == 'soft' and all(p is not None for p in probabilities):
+                    # 软投票：基于概率的加权平均
+                    probabilities = np.array(probabilities)  # shape: (n_models, n_samples, n_classes)
+                    weighted_proba = np.average(probabilities, axis=0, weights=weights)
+                    final_prediction = np.argmax(weighted_proba, axis=1)
+                    ensemble_proba = weighted_proba  # 保存加权概率用于返回
+                    logging.info("使用软投票（概率加权平均）")
+                else:
+                    # 硬投票：基于类别的加权投票
+                    ensemble_proba = None
+                    n_samples = len(predictions[0])
+                    final_prediction = np.zeros(n_samples, dtype=int)
+                    
+                    for i in range(n_samples):
+                        votes = [pred[i] for pred in predictions]
+                        vote_counts = {}
+                        for vote, weight in zip(votes, weights):
+                            vote_counts[vote] = vote_counts.get(vote, 0) + weight
+                        final_prediction[i] = max(vote_counts.items(), key=lambda x: x[1])[0]
+                    
+                    logging.info("使用硬投票（类别加权投票）")
                 
-                # 反向映射编码的标签
-                if self.target_encoder is not None:
-                    try:
-                        final_prediction = self.target_encoder.inverse_transform(final_prediction)
-                        logging.info("已对预测结果进行标签反向映射")
-                    except Exception as e:
-                        logging.warning(f"标签反向映射失败: {str(e)}")
+                # 注意：不再做 inverse_transform，让调用方(exec.py)统一处理标签转换
+                # exec.py 的 save_predictions 会根据 target_is_encoded=True 做反向映射
+            
+            else:
+                # 回归任务：质量门控集成预测
+                # 核心改进：在模型级别过滤质量差距过大的模型，而非逐样本检测异常
+                # 原因：回归任务中，低质量模型的预测会系统性偏移，逐样本过滤无法解决此问题
+                
+                best_score_val = np.max(scores)  # 最佳模型得分（neg_MSE，越接近0越好）
+                
+                # 质量门控：只保留得分在最佳模型合理范围内的模型
+                # 对于neg_MSE: best=-100, threshold=-200, 即只保留MSE不超过最佳2倍的模型
+                if abs(best_score_val) > 1e-8:
+                    quality_threshold = best_score_val * 2  # 允许2倍MSE降级
+                    quality_mask = scores >= quality_threshold
+                else:
+                    quality_mask = np.ones(len(scores), dtype=bool)
+                
+                n_quality_models = int(quality_mask.sum())
+                quality_model_names = [valid_models[i] for i in range(len(valid_models)) if quality_mask[i]]
+                
+                logging.info(f"回归质量门控: {n_quality_models}/{len(scores)}个模型通过 "
+                            f"(阈值={quality_threshold if abs(best_score_val) > 1e-8 else 'N/A'}, "
+                            f"最佳={best_score_val:.4f})")
+                logging.info(f"通过模型: {quality_model_names}")
+                logging.info(f"所有模型得分: {dict(zip(valid_models, scores.round(4)))}")
+                
+                if n_quality_models <= 1:
+                    # 只有最佳模型通过质量门控，直接使用最佳单模型预测
+                    final_prediction = predictions[0]  # top_models按分数降序排列，index 0为最佳
+                    logging.info(f"回归集成: 仅最佳模型通过质量门控，使用单模型预测")
+                else:
+                    # 使用通过质量门控的模型进行加权集成
+                    filtered_predictions = predictions[quality_mask]
+                    filtered_scores = scores[quality_mask]
+                    
+                    # 更激进的权重策略：高指数系数 + 无平方根平滑
+                    # 让最佳模型拥有压倒性权重，避免次优模型拉低整体表现
+                    if np.min(filtered_scores) == np.max(filtered_scores):
+                        filtered_weights = np.ones(len(filtered_scores))
+                    else:
+                        norm_scores = (filtered_scores - np.min(filtered_scores)) / \
+                                     (np.max(filtered_scores) - np.min(filtered_scores) + 1e-8)
+                        filtered_weights = np.exp(5 * norm_scores)  # 指数系数5（比分类任务的3更激进）
+                        # 注意：不使用sqrt平滑，让最佳模型权重更高
+                    
+                    filtered_weights = filtered_weights / filtered_weights.sum()
+                    
+                    logging.info(f"回归集成权重: {dict(zip(quality_model_names, filtered_weights.round(4)))}")
+                    
+                    # 向量化加权平均（高效且无需逐样本循环）
+                    final_prediction = np.average(filtered_predictions, axis=0, weights=filtered_weights)
+                
+                logging.info("使用质量门控加权平均（回归专用）")
 
+            final_prediction = np.array(final_prediction).flatten()
             logging.info(f"集成预测完成，最终预测结果长度: {len(final_prediction)}")
-            return final_prediction
+            
+            # 分类任务返回 (predictions, probabilities)，回归任务返回 (predictions, None)
+            if self.task_type in ['binary_classification', 'multiclass_classification']:
+                if ensemble_proba is not None:
+                    logging.info(f"返回集成预测和加权概率，概率shape: {ensemble_proba.shape}")
+                return (final_prediction, ensemble_proba)
+            else:
+                return (final_prediction, None)
 
         except Exception as e:
             logging.error(f"集成预测失败: {str(e)}")
+            import traceback
+            logging.error(traceback.format_exc())
             return None
 
 if __name__ == "__main__":

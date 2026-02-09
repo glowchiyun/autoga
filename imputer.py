@@ -39,6 +39,10 @@ class Imputer():
         self.threshold = threshold
 
         self.exclude = exclude  # to implement
+        
+        # 用于保存训练集的填充统计量（均值、中位数、众数等）
+        self.fitted_params_ = {}
+        self.is_fitted_ = False
 
     def get_params(self, deep=True):
 
@@ -64,25 +68,32 @@ class Imputer():
 
     # Handling Missing values
 
-    def mean_imputation(self, dataset):
+    def mean_imputation(self, dataset, fit_mode=True):
         # for numerical data
         # replace missing numerical values by the mean of
         # the corresponding variable
 
-        df = dataset
+        df = dataset.copy()
 
         if dataset.select_dtypes(['number']).isnull().sum().sum() > 0:
 
-            X = dataset.select_dtypes(['number'])
+            X = dataset.select_dtypes(['number']).copy()
 
             for i in X.columns:
-
-                X[i] = X[i].fillna(int(X[i].mean()))
+                # Fit mode: 计算并保存均值
+                if fit_mode:
+                    mean_val = X[i].mean()
+                    self.fitted_params_[i] = {'mean': mean_val}
+                    X[i] = X[i].fillna(mean_val)
+                else:
+                    # Test mode: 使用保存的均值
+                    if i in self.fitted_params_ and 'mean' in self.fitted_params_[i]:
+                        X[i] = X[i].fillna(self.fitted_params_[i]['mean'])
+                    else:
+                        # 如果训练时没有这个特征，使用当前均值
+                        X[i] = X[i].fillna(X[i].mean())
 
             Z = dataset.select_dtypes(exclude=['number'])
-
-            df = pd.DataFrame.from_records(
-                X, columns=dataset.select_dtypes(['number']).columns)
 
             df = pd.concat([X, Z], axis=1)
 
@@ -92,27 +103,34 @@ class Imputer():
 
         return df
 
-    def median_imputation(self, dataset):
+    def median_imputation(self, dataset, fit_mode=True):
         # only for numerical data
         # replace missing numerical values by the median
         # of the corresponding variable
 
-        df = dataset
+        df = dataset.copy()
 
         if dataset.select_dtypes(['number']).isnull().sum().sum() > 0:
 
-            X = dataset.select_dtypes(['number'])
+            X = dataset.select_dtypes(['number']).copy()
 
             for i in X.columns:
-
-                X[i] = X[i].fillna(int(X[i].median()))
+                # Fit mode: 计算并保存中位数
+                if fit_mode:
+                    median_val = X[i].median()
+                    self.fitted_params_[i] = {'median': median_val}
+                    X[i] = X[i].fillna(median_val)
+                else:
+                    # Test mode: 使用保存的中位数
+                    if i in self.fitted_params_ and 'median' in self.fitted_params_[i]:
+                        X[i] = X[i].fillna(self.fitted_params_[i]['median'])
+                    else:
+                        # 如果训练时没有这个特征，使用当前中位数
+                        X[i] = X[i].fillna(X[i].median())
 
             Z = dataset.select_dtypes(include=['object'])
 
-            df = pd.DataFrame.from_records(
-                X, columns=dataset.select_dtypes(['number']).columns)
-
-            df = df.join(Z)
+            df = pd.concat([X, Z], axis=1)
 
         else:
 
@@ -129,33 +147,63 @@ class Imputer():
 
         return dataset.dropna()
 
-    def MF_most_frequent_imputation(self, dataset):
+    def MF_most_frequent_imputation(self, dataset, fit_mode=True):
         # for both categorical and numerical data
         # replace missing values by the most frequent value
         # of the corresponding variable
 
-        for i in dataset.columns:
+        df = dataset.copy()
+        
+        for i in df.columns:
+            # Fit mode: 计算并保存众数
+            if fit_mode:
+                if not df[i].isnull().all():  # 确保列不是全部缺失
+                    mfv = df[i].value_counts().idxmax()
+                    self.fitted_params_[i] = {'most_frequent': mfv}
+                    df[i] = df[i].fillna(mfv)
+                    
+                    if self.verbose:
+                        print("Most frequent value for ", i, "is:", mfv)
+            else:
+                # Test mode: 使用保存的众数
+                if i in self.fitted_params_ and 'most_frequent' in self.fitted_params_[i]:
+                    mfv = self.fitted_params_[i]['most_frequent']
+                    df[i] = df[i].fillna(mfv)
+                    
+                    if self.verbose:
+                        print("Using saved most frequent value for ", i, ":", mfv)
+                else:
+                    # 如果训练时没有这个特征，使用当前众数
+                    if not df[i].isnull().all():
+                        mfv = df[i].value_counts().idxmax()
+                        df[i] = df[i].fillna(mfv)
 
-            mfv = dataset[i].value_counts().idxmax()
-
-            dataset[i] = dataset[i].replace(np.nan, mfv)
-
-            if self.verbose:
-
-                print("Most frequent value for ", i, "is:", mfv)
-
-        return dataset
+        return df
 
     def NaN_random_replace(self, dataset):
         # for both categorical and numerical data
         # replace missing data with a random observation with data
-        nan_mask = dataset.isna()
-        ran = pd.DataFrame(np.random.randn(
-            dataset.shape[0], dataset.shape[1]), columns=dataset.columns, index=dataset.index)
+        df = dataset.copy()
+        
+        # 分别处理数值列和非数值列
+        numeric_cols = df.select_dtypes(include=['number']).columns
+        non_numeric_cols = df.select_dtypes(exclude=['number']).columns
+        
+        # 对数值列用随机数填充
+        if len(numeric_cols) > 0:
+            for col in numeric_cols:
+                if df[col].isna().any():
+                    df.loc[df[col].isna(), col] = np.random.randn(df[col].isna().sum())
+        
+        # 对非数值列用随机已有值填充
+        if len(non_numeric_cols) > 0:
+            for col in non_numeric_cols:
+                if df[col].isna().any():
+                    non_na_values = df[col].dropna().values
+                    if len(non_na_values) > 0:
+                        df.loc[df[col].isna(), col] = np.random.choice(non_na_values, df[col].isna().sum())
 
-        dataset[nan_mask] = ran[nan_mask]
-
-        return dataset
+        return df
 
     def KNN_imputation(self, dataset, k=4):
         # only for numerical values
@@ -244,12 +292,33 @@ class Imputer():
 
         return df
 
-    def transform(self):
+    def transform(self, new_data=None):
+        """
+        填充缺失值
+        
+        Parameters
+        ----------
+        new_data : pd.DataFrame, optional
+            如果提供，则使用训练时保存的统计量填充新数据（测试集）
+            如果不提供，则在 self.dataset 上进行 fit + transform（训练集）
+            
+        Returns
+        -------
+        pd.DataFrame
+            填充后的数据
+        """
+        # 判断是训练阶段还是测试阶段
+        fit_mode = (new_data is None)
+        d = self.dataset if fit_mode else new_data
+        
         start_time = time.time()
-        print(">>Imputation ")
-        impd = self.dataset
-        d=self.dataset
-        dn=self.dataset
+        if fit_mode:
+            print(">>Imputation (Training)")
+        else:
+            print(">>Imputation (Testing - using saved params)")
+        
+        impd = d
+        dn = d
         total_missing_before = d.isnull().sum().sum()
         Num_missing_before = d.select_dtypes(
         include=['number']).isnull().sum().sum()
@@ -283,11 +352,11 @@ class Imputer():
         elif (self.strategy == "RAND"):
             dn = self.NaN_random_replace(d)
         elif (self.strategy == "MF"):
-            dn = self.MF_most_frequent_imputation(d)
+            dn = self.MF_most_frequent_imputation(d, fit_mode=fit_mode)
         elif (self.strategy == "MEAN"):
-            dn = self.mean_imputation(d)
+            dn = self.mean_imputation(d, fit_mode=fit_mode)
         elif (self.strategy == "MEDIAN"):
-            dn = self.median_imputation(d)
+            dn = self.median_imputation(d, fit_mode=fit_mode)
         elif (self.strategy == "DROP"):
             dn = self.NaN_drop(d)
         else:
@@ -309,4 +378,9 @@ class Imputer():
         print("Imputation done -- CPU time: %s seconds" %
               (time.time() - start_time))
         print()
+        
+        # 标记为已训练
+        if fit_mode:
+            self.is_fitted_ = True
+        
         return impd
