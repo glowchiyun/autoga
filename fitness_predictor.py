@@ -46,8 +46,8 @@ class FitnessPredictor:
             'chromosomes': [],
             'fitnesses': []
         }
-        self.min_samples_to_train = 20    # 最少20个样本才训练（降低门槛以更快启用）
-        self.retrain_interval = 30        # 每30个新样本重新训练
+        self.min_samples_to_train = 12    # 最少12个样本才训练（pop=20时第一代即可启用）
+        self.retrain_interval = 15        # 每15个新样本重新训练（保持模型时效性）
         self.prediction_confidence = 0.0  # 预测置信度（基于交叉验证R²）
         self._samples_since_train = 0     # 上次训练后新增的样本数
         

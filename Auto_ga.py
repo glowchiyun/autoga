@@ -416,7 +416,7 @@ class GeneticAlgorithm:
             if self.use_prediction and self.fitness_predictor.is_trained:
                 confidence = self.fitness_predictor.get_confidence()
                 
-                if confidence > 0.3:  # 降低门槛到0.3（使代理模型更早发挥作用）
+                if confidence > 0.15:  # 置信度门槛降低到0.15（更早激活代理模型）
                     # 使用不确定性估计（RF树方差）进行更智能的跳过决策
                     predicted_fitness, uncertainty = self.fitness_predictor.predict_with_uncertainty(chromo)
                     
@@ -424,13 +424,14 @@ class GeneticAlgorithm:
                         # 计算相对差距
                         relative_gap = (self.best_score - predicted_fitness) / max(abs(self.best_score), 0.01)
                         
-                        # 策略：预测分数远低于最佳分数，且不确定性低时，跳过评估
-                        # 不确定性高意味着模型"不确定"，应该评估以获取信息
+                        # 策略：预测分数低于最佳分数，且不确定性可接受时，跳过评估
+                        # uncertainty_ratio放宽至0.6，避免RF小样本时树间方差过滤掉太多跳过机会
                         uncertainty_ratio = uncertainty / max(abs(predicted_fitness), 0.01) if uncertainty is not None else 1.0
                         
-                        if relative_gap > 0.05 and uncertainty_ratio < 0.3:
-                            # 跳过概率随差距增大和置信度增加而增大
-                            base_skip = min(0.6, relative_gap * 4)
+                        if relative_gap > 0.02 and uncertainty_ratio < 0.6:
+                            # 跳过概率随差距增大而快速增大，上限提高至0.92
+                            # relative_gap=0.02 → base_skip=0.30; 0.05 → 0.75; ≥0.08 → 0.92
+                            base_skip = min(0.92, relative_gap * 15)
                             skip_probability = base_skip * min(confidence, 1.0)
                             should_evaluate = random.random() > skip_probability
                             
@@ -950,23 +951,14 @@ class GeneticAlgorithm:
     def add_top_models(self, chromosome, score, model, processed_features=None):
         """
         维护ensemble_size大小的top_models，保证其中模型类型各不相同且分数最优。
+        注意：此方法不再做任何质量门控，所有top_models无条件添加。
+        质量过滤延迟到integrated_predict阶段（回归任务专用）。
+        
         :param chromosome: 染色体（配置）
         :param score: 模型得分
         :param model: 训练好的模型
         :param processed_features: 预处理后的特征列名列表
         """
-        # 回归任务质量门控：拒绝与最佳模型差距过大的模型进入候选池
-        if self.task_type == 'regression' and len(self.top_models) > 0:
-            best_existing_score = self.top_models[0]['score']  # 已按分数降序排列
-            if abs(best_existing_score) > 1e-8:
-                # 对于neg_MSE（负值，越接近0越好），只保留MSE不超过最佳3倍的模型
-                # 例: best=-100, threshold=-300, score=-500 会被拒绝
-                quality_threshold = best_existing_score * 3
-                if score < quality_threshold:
-                    logging.debug(f"回归质量门控: 拒绝低质量模型 (score={score:.4f}, "
-                                  f"best={best_existing_score:.4f}, threshold={quality_threshold:.4f})")
-                    return
-        
         # 解码染色体获取模型类型
         config = self.decode_chromosome(chromosome)
         model_type = config['model']
@@ -1154,56 +1146,21 @@ class GeneticAlgorithm:
                 # exec.py 的 save_predictions 会根据 target_is_encoded=True 做反向映射
             
             else:
-                # 回归任务：质量门控集成预测
-                # 核心改进：在模型级别过滤质量差距过大的模型，而非逐样本检测异常
-                # 原因：回归任务中，低质量模型的预测会系统性偏移，逐样本过滤无法解决此问题
+                # 回归任务：直接使用最佳单模型预测（不进行集成）
+                # 原因：回归集成容易因为低质量模型拉低整体表现
                 
-                best_score_val = np.max(scores)  # 最佳模型得分（neg_MSE，越接近0越好）
+                if len(predictions) == 0:
+                    logging.error("回归预测：没有可用的预测结果")
+                    return None
                 
-                # 质量门控：只保留得分在最佳模型合理范围内的模型
-                # 对于neg_MSE: best=-100, threshold=-200, 即只保留MSE不超过最佳2倍的模型
-                if abs(best_score_val) > 1e-8:
-                    quality_threshold = best_score_val * 2  # 允许2倍MSE降级
-                    quality_mask = scores >= quality_threshold
-                else:
-                    quality_mask = np.ones(len(scores), dtype=bool)
+                # 直接使用得分最高的模型（第一个模型，因为top_models已按分数排序）
+                best_idx = np.argmax(scores)
+                final_prediction = predictions[best_idx]
+                best_model_name = valid_models[best_idx]
+                best_score = scores[best_idx]
                 
-                n_quality_models = int(quality_mask.sum())
-                quality_model_names = [valid_models[i] for i in range(len(valid_models)) if quality_mask[i]]
-                
-                logging.info(f"回归质量门控: {n_quality_models}/{len(scores)}个模型通过 "
-                            f"(阈值={quality_threshold if abs(best_score_val) > 1e-8 else 'N/A'}, "
-                            f"最佳={best_score_val:.4f})")
-                logging.info(f"通过模型: {quality_model_names}")
-                logging.info(f"所有模型得分: {dict(zip(valid_models, scores.round(4)))}")
-                
-                if n_quality_models <= 1:
-                    # 只有最佳模型通过质量门控，直接使用最佳单模型预测
-                    final_prediction = predictions[0]  # top_models按分数降序排列，index 0为最佳
-                    logging.info(f"回归集成: 仅最佳模型通过质量门控，使用单模型预测")
-                else:
-                    # 使用通过质量门控的模型进行加权集成
-                    filtered_predictions = predictions[quality_mask]
-                    filtered_scores = scores[quality_mask]
-                    
-                    # 更激进的权重策略：高指数系数 + 无平方根平滑
-                    # 让最佳模型拥有压倒性权重，避免次优模型拉低整体表现
-                    if np.min(filtered_scores) == np.max(filtered_scores):
-                        filtered_weights = np.ones(len(filtered_scores))
-                    else:
-                        norm_scores = (filtered_scores - np.min(filtered_scores)) / \
-                                     (np.max(filtered_scores) - np.min(filtered_scores) + 1e-8)
-                        filtered_weights = np.exp(5 * norm_scores)  # 指数系数5（比分类任务的3更激进）
-                        # 注意：不使用sqrt平滑，让最佳模型权重更高
-                    
-                    filtered_weights = filtered_weights / filtered_weights.sum()
-                    
-                    logging.info(f"回归集成权重: {dict(zip(quality_model_names, filtered_weights.round(4)))}")
-                    
-                    # 向量化加权平均（高效且无需逐样本循环）
-                    final_prediction = np.average(filtered_predictions, axis=0, weights=filtered_weights)
-                
-                logging.info("使用质量门控加权平均（回归专用）")
+                logging.info(f"回归任务：使用最佳单模型 {best_model_name} 进行预测，得分: {best_score:.4f}")
+                logging.info("回归任务已禁用集成预测，直接使用最佳模型")
 
             final_prediction = np.array(final_prediction).flatten()
             logging.info(f"集成预测完成，最终预测结果长度: {len(final_prediction)}")
